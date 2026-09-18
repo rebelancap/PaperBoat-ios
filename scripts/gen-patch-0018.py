@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Overlay patch 0018 — iOS bundle target: INSTALL_PATH / SKIP_INSTALL so
+`xcodebuild archive` produces an archive `-exportArchive` can read.
+
+CLASS: (b) upstream bug fix worth sending. It fixes upstream's OWN iOS target
+for anyone who tries to archive it; nothing in it is specific to this port.
+
+THE BUG. Upstream's `if(IOS)` bundle target never sets `INSTALL_PATH` or
+`SKIP_INSTALL`, and CMake's Xcode generator defaults an executable target to
+`SKIP_INSTALL = YES` with an empty `INSTALL_PATH`. `xcodebuild archive` then
+writes an archive whose `Products/` is EMPTY and whose `Info.plist` carries no
+`ApplicationProperties`. `-exportArchive` reports
+
+    error: exportArchive exportOptionsPlist error for key "method"
+           expected one {} but found debugging
+
+which names the wrong thing entirely: `{}` is the empty set of distribution
+methods Xcode computed for an archive it found no application in. The method key
+is fine. Full diagnosis in the measurement log M-021b and the design notes D21/D22.
+
+THE FIX is the two attributes every sibling port sets on its own iOS target
+(Lighthouse/Shipwright/Ghostship/Starship `0004`/`0012`-series patches):
+`XCODE_ATTRIBUTE_INSTALL_PATH "$(LOCAL_APPS_DIR)"` and
+`XCODE_ATTRIBUTE_SKIP_INSTALL "NO"`. `$(LOCAL_APPS_DIR)` is an Xcode build
+setting reference, not a CMake one — CMake expands `${}`, never `$()`, so it
+reaches the pbxproj verbatim.
+
+Setting them on the BUNDLE TARGET ONLY is the whole point. Forcing
+`SKIP_INSTALL=NO INSTALL_PATH=/Applications` on the `xcodebuild` command line
+(the workaround tried in M-021b) applies to every target in the project, so the
+archive gains the app *and* sixteen static libraries, and still has no
+`ApplicationProperties`.
+
+WHERE IT IS PLACED, AND WHY NOT NEXT TO THE OTHER PROPERTIES. The natural home
+is the `set_target_properties(... MACOSX_BUNDLE TRUE ...)` block, but overlay
+0006's hunk uses the lines around it as context, and `apply-overlay.sh` decides
+"already applied" by reverse-applying at fuzz=0 — two patches sharing context
+lines break on the second build (the porting notes). So this goes in its own
+`if(IOS)` block immediately before the config.yml/assets bundling block, a
+region no other patch in the series touches. CMake applies target properties
+wherever they are set; placement is a patch-hygiene choice, not a semantic one.
+
+A SECOND hygiene point, paid for once here. The first draft of this patch ended
+its inserted block with `endif()` followed by a blank line — which is exactly
+the three-line leading context of its own hunk (`    )` / `endif()` / blank).
+The hunk therefore matched AGAIN, at an offset, on the second
+`scripts/apply-overlay.sh` run and inserted the block twice. `endif()` carries a
+trailing comment so that the inserted text cannot reproduce its own context.
+"""
+import subprocess, pathlib, tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VENDOR = ROOT / "vendor/PaperBoat"
+REL = "CMakeLists.txt"
+OUT = ROOT / "overlay/patches/0018-paperboat-ios-archive-install-path.patch"
+
+src = VENDOR / REL
+orig = src.read_text()
+
+ANCHOR = ("# Torch reads config.yml and the asset yamls off disk to extract a ROM. Android\n")
+INSERT = """# PAPERBOAT_IOS (overlay 0018): make `xcodebuild archive` archivable.
+#
+# Without these two attributes the Xcode generator leaves the bundle target at
+# SKIP_INSTALL=YES with an empty INSTALL_PATH, so `xcodebuild archive` produces
+# an archive with an EMPTY Products/ and no ApplicationProperties, and
+# -exportArchive fails with the misleading
+#   error: exportArchive exportOptionsPlist error for key "method"
+#          expected one {} but found debugging
+# ({} is the empty set of methods Xcode computed for an archive with no app in
+# it). $(LOCAL_APPS_DIR) is an Xcode build setting, not a CMake variable.
+if(IOS)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        XCODE_ATTRIBUTE_INSTALL_PATH "$(LOCAL_APPS_DIR)"
+        XCODE_ATTRIBUTE_SKIP_INSTALL "NO"
+    )
+endif() # overlay 0018
+"""
+
+# Asserted match count: a silent no-op edit must not ship (ground rule 3).
+n = orig.count(ANCHOR)
+assert n == 1, f"{REL}: expected 1 occurrence of the bundling-block anchor, got {n}"
+assert "XCODE_ATTRIBUTE_INSTALL_PATH" not in orig, f"{REL}: INSTALL_PATH already set"
+assert "XCODE_ATTRIBUTE_SKIP_INSTALL" not in orig, f"{REL}: SKIP_INSTALL already set"
+
+text = orig.replace(ANCHOR, INSERT + ANCHOR, 1)
+assert text.count("XCODE_ATTRIBUTE_INSTALL_PATH") == 1
+assert text.count("XCODE_ATTRIBUTE_SKIP_INSTALL") == 1
+
+with tempfile.NamedTemporaryFile("w", suffix=".a", delete=False) as fa, \
+     tempfile.NamedTemporaryFile("w", suffix=".b", delete=False) as fb:
+    fa.write(orig); fb.write(text); fa.flush(); fb.flush()
+    r = subprocess.run(["diff", "-u", "--label", f"a/{REL}", "--label", f"b/{REL}",
+                        fa.name, fb.name], capture_output=True)
+assert r.returncode == 1, "diff produced no change"
+
+OUT.write_text(__doc__ + "\n" + r.stdout.decode())
+print(f"wrote {OUT}")

@@ -1,0 +1,152 @@
+Overlay patch 0035 - the widened backdrop actually COVERS the rows it claims.
+
+CLASS: (b) upstream bug fix worth sending, and the direct follow-up to 0029 and
+0032. Not iOS-gated, for the same reason those two are not: it is a rendering
+correctness fix and gating it would put the macOS oracle (the spec's ground
+truth) permanently out of parity with the phone.
+
+WHAT THE USER SAW ON 0.0.0.12
+---------------------------
+The new-game opening, Mario's house exterior, 2x SSAA: the top ~105 px band
+that 0029 un-letterboxed shows DUPLICATED TEXTURE ROWS that smear as the camera
+pans. Indoor scenes (Peach's castle) show nothing wrong.
+
+WHY - AND IT IS 0032'S OWN DOING, HALF-DONE
+-------------------------------------------
+Overlay 0032 removed the hand-drawn black bars in `gfx_draw_background` by
+widening the LOCALS `backgroundMinY` / `backgroundMaxY` to 0..SCREEN_HEIGHT when
+`cam_frame_fills_height()`, which makes both `gDPFillWideRectangle` letterbox
+fills no-ops. That is right for the fill path - the non-texture backdrop is
+drawn from those same two locals, so it grew with them.
+
+The TEXTURE path does not read them. `port_appendGfx_background_texture()`
+(`src/port/patches/BackgroundPatches.c`) takes its own copies straight from
+`gGameStatusPtr->background{Min,Max}Y` and emits its texrects from `bgMinY` to
+`bgMinY + bgMaxY - 1` - native rows 20..219 for PM64's 296x200 backdrops. So
+after 0032, on any map WITH a backdrop image (i.e. every outdoor one):
+
+  * rows 0..19 and 220..239 get no colour write at all - not the backdrop, not
+    the bgColor fill (which is also clamped), and no longer the black bars;
+  * 3D geometry that reaches into the band draws over whatever was in the
+    framebuffer;
+  * and PM64 captures the framebuffer every frame (`port_emitPrevFrameCapture`,
+    `gfx_frame.c:72`) for its shared-framebuffer effects, so the stale rows are
+    carried FORWARD - which is the smear, not a static band.
+
+Indoor maps ship no backdrop header, take the `!BACKGROUND_FLAG_TEXTURE` fill
+path, and are therefore correct already: exactly what the user observed.
+
+THE FIX, TWO HALVES
+-------------------
+1. `src/background_gfx.c` - when the camera fills the screen, clear the FULL
+   screen to `bgColor` before the backdrop is drawn. The fill colour is already
+   set to `camera->bgColor` and the RDP is already in G_CYC_FILL at that point,
+   so this is one rectangle. It is the insurance half: after it, no pixel of the
+   frame can ever be stale, whichever backdrop path runs (texture, non-texture,
+   or the sine-wave strip path, which this patch deliberately leaves alone -
+   its strips are per-row and stretching them is a different change).
+
+2. `src/port/patches/BackgroundPatches.c` - when the camera fills the screen,
+   the tiled backdrop texrects span 0..SCREEN_HEIGHT-1 instead of
+   bgMinY..bgMinY+bgMaxY-1, with the T coordinate biased by -bgMinY rows so the
+   image still lands on its native rows. The extra 20 rows top and bottom are
+   the image's own EDGE ROW repeated, because the tile is already clamped in T:
+   `interpreter.cpp:3822` rewrites `cmt == G_TX_WRAP && maskt == G_TX_NOMASK`
+   (which is exactly what `gDPLoadTextureTile` is called with here) to
+   `G_TX_CLAMP`. So no tile state changes - only the rectangle grows, and the
+   sampler was always going to clamp. Against the oracle's 4:3 frame the top
+   band is sky continuing into sky, which is what a widescreen fit should look
+   like; the bottom band sits behind the map's terrain in every scene checked.
+
+WHAT IT DELIBERATELY DOES NOT DO
+--------------------------------
+* No camera field is written, exactly as after 0029 and 0032.
+* Both halves are gated on `cam_frame_fills_height()` - the same predicate 0032
+  introduced and 0029's two hunks fire on - so the game's own letterboxed
+  cameras (the demo's 177-tall viewport, the title and file select's 184, the
+  intro's 162, every `cam_api` cutscene viewport) and 4:3 or narrower are
+  untouched and still frame themselves.
+* The title screen's `gBackroundNoTileFill` path is untouched: the title camera
+  fails `cam_frame_fills_height()`.
+* The wave path keeps its native rows; the bgColor clear covers its bands.
+
+WHERE THE HUNKS SIT
+-------------------
+* `src/background_gfx.c`: one hunk at the top of the backdrop block, ~14 lines
+  after overlay 0032's hunk in the same file - no shared context line.
+* `src/port/patches/BackgroundPatches.c`: no other patch in the series touches
+  this file.
+
+Match-count asserted against the pristine vendor state.
+
+--- a/src/background_gfx.c
++++ b/src/background_gfx.c
+@@ -471,6 +471,22 @@
+                 // The backdrop fills the camera's frame; the margin around it is painted
+                 // black below, with the letterbox.
+                 get_cam_frame_x(gCurrentCameraID, &frameLeft, &frameRight);
++
++                // PAPERBOAT (overlay 0035): clear the WHOLE screen to bgColor
++                // first when the camera fills it. Overlay 0032 made the black
++                // letterbox bars no-ops, but the backdrop itself still only
++                // covers the map's own rows (20..219 of 240 for a 296x200
++                // background), so rows 0..19 and 220..239 received no colour
++                // write at all - and PM64 mirrors the framebuffer every frame
++                // for its shared-framebuffer effects, so whatever was left
++                // there was carried forward and smeared. The fill colour is
++                // already camera->bgColor and the RDP is already in G_CYC_FILL,
++                // so this is one rectangle, and it makes a stale pixel
++                // impossible whichever backdrop path runs below.
++                if (cam_frame_fills_height(gCurrentCameraID)) {
++                    gDPFillWideRectangle(gMainGfxPos++, wsLeft, 0, wsRight - 1, SCREEN_HEIGHT - 1);
++                    gDPPipeSync(gMainGfxPos++);
++                }
+ 
+                 if (!(gGameStatusPtr->backgroundFlags & BACKGROUND_FLAG_TEXTURE)) {
+                     gDPFillWideRectangle(gMainGfxPos++, frameLeft, backgroundMinY, frameRight - 1, backgroundMaxY - 1);
+--- a/src/port/patches/BackgroundPatches.c
++++ b/src/port/patches/BackgroundPatches.c
+@@ -298,6 +298,26 @@
+         s32 wsLeft;
+         s32 wsRight;
+         s32 tx, bgTileBaseX = bgMinX;
++        // PAPERBOAT (overlay 0035): the backdrop's vertical extent. Normally the
++        // map's own rows (bgMinY .. bgMinY + bgMaxY - 1, i.e. 20..219 of 240);
++        // when the camera fills the screen (overlay 0029/0032) the rectangle
++        // grows to the full 0..SCREEN_HEIGHT-1 and the T coordinate is biased
++        // back by bgMinY rows so the image still lands where it always did. The
++        // extra rows are the image's own top and bottom row repeated: the tile
++        // is loaded with cmt = G_TX_WRAP and maskt = G_TX_NOMASK, which
++        // Fast3D rewrites to G_TX_CLAMP (interpreter.cpp:3822), so nothing about
++        // the tile changes - only the rectangle. Without this, those rows got no
++        // colour write at all and PM64's per-frame framebuffer mirror smeared
++        // whatever was already there.
++        s32 bgTop = bgMinY;
++        s32 bgBottom = bgMaxY - 1 + bgMinY;
++        s32 bgTBias = 0;
++
++        if (cam_frame_fills_height(gCurrentCameraID)) {
++            bgTop = 0;
++            bgBottom = SCREEN_HEIGHT - 1;
++            bgTBias = -bgMinY * 32;
++        }
+ 
+         get_cam_frame_x(gCurrentCameraID, &wsLeft, &wsRight);
+ 
+@@ -313,12 +333,12 @@
+ 
+         for (tx = bgTileBaseX; tx < wsRight; tx += bgMaxX) {
+             gSPWideTextureRectangle(
+-                gMainGfxPos++, tx * 4, bgMinY * 4, (bgXOffset + tx - 1) * 4 + bgEdge,
+-                (bgMaxY - 1 + bgMinY) * 4 + bgEdge, G_TX_RENDERTILE, (bgMaxX - bgXOffset) * 32, 0, bgDsdx, 1024
++                gMainGfxPos++, tx * 4, bgTop * 4, (bgXOffset + tx - 1) * 4 + bgEdge,
++                bgBottom * 4 + bgEdge, G_TX_RENDERTILE, (bgMaxX - bgXOffset) * 32, bgTBias, bgDsdx, 1024
+             );
+             gSPWideTextureRectangle(
+-                gMainGfxPos++, (bgXOffset + tx) * 4, bgMinY * 4, (bgMaxX + tx - 1) * 4 + bgEdge,
+-                (bgMaxY - 1 + bgMinY) * 4 + bgEdge, G_TX_RENDERTILE, 0, 0, bgDsdx, 1024
++                gMainGfxPos++, (bgXOffset + tx) * 4, bgTop * 4, (bgMaxX + tx - 1) * 4 + bgEdge,
++                bgBottom * 4 + bgEdge, G_TX_RENDERTILE, 0, bgTBias, bgDsdx, 1024
+             );
+         }
+     } else {

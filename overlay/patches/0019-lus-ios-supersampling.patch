@@ -1,0 +1,137 @@
+Overlay patch 0019 - iOS supersampling (SSAA) and the sub-native fix.
+
+CLASS: (a) program-baseline parity. Cross-port adoption of Lighthouse's overlay
+0036 (itself Ghostship's 0032, device-confirmed), re-authored against this
+port's LUS fork (`JeodC/libultraship`, branch `lus-converge`).
+
+THE RULE (docs/parity-checklist.md, "The two rules, exactly")
+------------------------------------------------------------
+In `Interpreter::StartFrame`, after the `mCurDimensions.height == 0` guard and
+BEFORE the framebuffer-resize block, scale `mCurDimensions` ONLY, by
+
+    f = (nativeDrawablePxLongEdge / mCurDimensions.width) * ssaa
+
+clamped to `mRapi->GetMaxTextureSize()`. `mNativeDimensions` and
+`mGameWindowViewport` are untouched: their uses are equality-guarded and
+deactivate to the safe full-framebuffer path.
+
+WHY THE FACTOR IS NATIVE-PX-RELATIVE
+------------------------------------
+`Fast3dGui::CalculateGameViewport` sets `mCurDimensions` from the "Main Game"
+ImGui window's content region, and `ImGui::Image` then scales the offscreen
+game framebuffer up to the native-pixel fb0. Whether that content region
+arrives in points (the sibling ports' finding: iPhone rendered 1824x840 into a
+2736x1260 drawable, 67 %) or already in drawable pixels (which is what this
+fork's `io.DisplaySize` implies on iOS - the design notes D16), the ratio form lands
+the render on exactly `nativePx * ssaa`. It is therefore self-correcting: with
+ssaa = 1.0 the render is native, never sub-native and never above it.
+
+`internal_mul` (the Internal Resolution slider) cancels out of the same
+expression, which is why overlay 0020 pins and greys that widget rather than
+leaving a slider that cannot move a pixel.
+
+THE SHELL'S TWO HOOKS
+---------------------
+    extern "C" float    PBIos_SsaaFactor(void);        // gSohIos.Supersample
+    extern "C" uint32_t PBIos_DrawablePixelWidth(void); // CAMetalLayer px, long edge
+
+Both live in `app/ios/PaperBoatIosShell.m` (the same linkage pattern as
+`PBIos_IsBackgrounded` in overlay 0008 and `PBIos_GetSafeAreaInsets` in 0013).
+`PBIos_SsaaFactor` reads the CVar and falls back to a Metal-GPU-family device
+tier (Apple8 -> 2.0, Apple7 -> 1.5, else 1.0) when it is unset; the shell, not
+this file, owns those defaults. A 0 from either hook means "not ready yet" and
+this block does nothing at all, which is byte-identical to upstream.
+
+CVAR BLOCK: `gSohIos.*`, deliberately - the family-wide harbour-shell block,
+kept verbatim so the eventual extraction does not have to rename anything.
+Recorded in the shell divergence notes.
+
+WHAT IT EXPORTS BACK
+--------------------
+`gPBIosSsaaW` / `gPBIosSsaaH`, the effective dimensions, for the bridge's
+`ssaa` verb. They are also SPDLOG'd once per change, which is the artifact the
+spec's rule 6 asks for on a claim like "2.0x doubles the render".
+
+`__IOS__`-only, so the macOS oracle stays pristine.
+
+WHERE THE HUNK SITS
+-------------------
+One hunk, in and immediately above `Interpreter::StartFrame` (~:7020). No other
+patch in the series touches `external/libultraship/src/fast/interpreter.cpp`.
+
+Match-count asserted against the pristine vendor state.
+
+--- a/external/libultraship/src/fast/interpreter.cpp
++++ b/external/libultraship/src/fast/interpreter.cpp
+@@ -7015,7 +7015,21 @@
+     }
+     return false;
+ #endif
++}
++
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0019): SSAA hooks provided by the app shell
++// (app/ios/PaperBoatIosShell.m). Same linkage pattern as PBIos_IsBackgrounded
++// (overlay 0008) and PBIos_GetSafeAreaInsets (overlay 0013): the shell owns
++// every iOS-only default, the engine only spends them.
++extern "C" float PBIos_SsaaFactor(void);
++extern "C" uint32_t PBIos_DrawablePixelWidth(void);
++// The effective render size, published back for the bridge's `ssaa` verb.
++extern "C" {
++volatile uint32_t gPBIosSsaaW = 0;
++volatile uint32_t gPBIosSsaaH = 0;
+ }
++#endif
+ 
+ void Interpreter::StartFrame() {
+     mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
+@@ -7023,7 +7037,49 @@
+     if (mCurDimensions.height == 0) {
+         // Avoid division by zero
+         mCurDimensions.height = 1;
++    }
++#ifdef __IOS__
++    // PAPERBOAT_IOS (overlay 0019) SSAA. CalculateGameViewport has just set
++    // mCurDimensions from ImGui's "Main Game" content region; the game renders
++    // offscreen into mGameFb and ImGui::Image scales that to the native-pixel
++    // fb0. Scale mCurDimensions to (native drawable px * ssaa) so that scale is
++    // a downsample (supersample) and never an upscale.
++    //
++    // The factor is a RATIO against the incoming width, so it lands on
++    // nativePx * ssaa whether mCurDimensions arrives in points or already in
++    // drawable pixels - and internal_mul cancels straight out of it (overlay
++    // 0020 greys that slider for exactly this reason).
++    //
++    // Uniform factor => the aspect ratio is unchanged. mNativeDimensions and
++    // mGameWindowViewport are NOT scaled: their uses are equality-guarded and
++    // deactivate to the safe full-framebuffer path.
++    {
++        const float pbSsaa = PBIos_SsaaFactor();
++        const uint32_t pbNativePxW = PBIos_DrawablePixelWidth();
++        if (pbSsaa > 0.0f && pbNativePxW > 0 && mCurDimensions.width > 0) {
++            const float pbF = ((float)pbNativePxW / (float)mCurDimensions.width) * pbSsaa;
++            uint32_t pbW = (uint32_t)(mCurDimensions.width * pbF + 0.5f);
++            uint32_t pbH = (uint32_t)(mCurDimensions.height * pbF + 0.5f);
++            // mGameFb is a texture - clamp uniformly to the backend's maximum.
++            const int pbMax = mRapi->GetMaxTextureSize();
++            if (pbMax > 0 && ((int)pbW > pbMax || (int)pbH > pbMax)) {
++                const float pbClamp = (float)pbMax / (float)(pbW > pbH ? pbW : pbH);
++                pbW = (uint32_t)(pbW * pbClamp);
++                pbH = (uint32_t)(pbH * pbClamp);
++            }
++            if (pbW != gPBIosSsaaW || pbH != gPBIosSsaaH) {
++                // Once per change, not per frame: the artifact behind any claim
++                // about what a factor actually renders (spec rule 6).
++                SPDLOG_INFO("PB_SSAA factor={:.2f} drawable_px={} in={}x{} -> {}x{} (max_tex={})", pbSsaa, pbNativePxW,
++                            mCurDimensions.width, mCurDimensions.height, pbW, pbH, pbMax);
++                gPBIosSsaaW = pbW;
++                gPBIosSsaaH = pbH;
++            }
++            mCurDimensions.width = pbW;
++            mCurDimensions.height = pbH;
++        }
+     }
++#endif
+     mCurDimensions.aspect_ratio = (float)mCurDimensions.width / (float)mCurDimensions.height;
+ 
+     // Update the framebuffer sizes when the viewport or native dimension changes

@@ -1,0 +1,133 @@
+Overlay patch 0026 - the audio reservoir is a setting, and the underrun warning stops shouting.
+
+CLASS: (a) program-baseline parity.
+
+WHY
+---
+The user on 0.0.0.5: "i hear some stuttering every ~5 seconds or so in the audio.
+maybe the video stutters a bit too at the same time." His device log carries 86
+`audio queue underran` warnings in 248 s - 35 clusters, median gap 4.06 s - and
+the simulator reproduces it faithfully (22 clusters in 227 s, median 5.56 s;
+the measurement log M-025).
+
+`docs/frame-map.md` explains why the two symptoms arrive together and cannot be
+separated: `gfx_frame.c` calls `GameEngine_StartAudioFrame()` at the top of every
+game frame and `GameEngine_EndAudioFrame()` before the submit, so the audio
+thread is woken exactly once per game frame and the game thread blocks on it.
+The reservoir is therefore a straight timing budget: if the main loop's period
+ever exceeds what is queued, the queue empties, and the same long frame is seen
+as well as heard.
+
+That budget is `DesiredBuffered = 1680` samples at 32 kHz = **52.5 ms**, which
+is half of what the siblings run (Lighthouse's 0044 made the same number a CVar
+for the same reason) and only 1.6 game frames deep. A single 60 ms frame - which
+this port takes routinely on a scene change - empties it.
+
+WHAT THIS PATCH DOES
+--------------------
+1. **`gSohIos.AudioBufferMs` (default 90 ms).** The reservoir in milliseconds,
+   converted to samples at init. 90 ms is ~2.7 game frames and, importantly, is
+   the largest value this engine can actually hold: `SDLAudioPlayer::DoPlay`
+   refuses to queue anything once `Buffered() >= 6000` samples, and the audio
+   thread's own skip-when-above guard is `Buffered() > 2 * DesiredBuffered`. Go
+   past 3000 samples (93.75 ms) and the guard sits above the hard ceiling, so it
+   never fires, the queue parks at 6000 (187 ms of latency) and nothing trims it.
+   Clamped to [30, 90] for that reason, with the ceiling named in the comment so
+   the next person does not "improve" it to 200.
+   Read ONCE, at `InitAudio` - changing it takes a relaunch, which the tooltip
+   in Settings > iOS says.
+
+2. **The warning is rate-limited to one per second, and counted instead.**
+   Release builds run an `spdlog::async_logger` with `async_overflow_policy::block`
+   and `flush_on(info)` (`ship/Context.cpp`), writing to a rotating file sink in
+   `Documents/logs/`. Every underrun therefore costs the AUDIO thread a queue
+   push and the worker a file flush, while the game thread is blocked on the
+   audio cv waiting for that same thread - a small self-amplifying loop at
+   exactly the moment the port can least afford one, and 86 identical lines that
+   say nothing the count does not. The count goes to the perf harness
+   (`underruns` in the `fps` line, overlay 0012 rev2), which is the number to
+   watch in an A/B; the log keeps one line per second so a device run with no
+   console attached still leaves the evidence.
+
+WHAT IT DELIBERATELY DOES NOT DO
+--------------------------------
+It does not touch the produce/skip/refill loop. `docs/lus-divergence.md` already
+audited that loop against SYNC WAVE 2 §B and found it correct - the
+skip-when-above guard, the bounded refill and the silence pre-roll are all
+present and are upstream's own. The reservoir depth was the only number wrong.
+
+UPSTREAMABLE: the rate limit, probably (as a plain `spdlog` rate limit, no
+counter). The CVar is ours - upstream's desktop path does not have the problem.
+
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -259,7 +259,37 @@
+     spdlog::flush_on(spdlog::level::warn);
+ #endif
+ 
++#ifdef __IOS__
++    // PAPERBOAT_IOS (overlay 0026): the audio reservoir, in milliseconds.
++    //
++    // Upstream's 1680 samples at 32 kHz is 52.5 ms - 1.6 game frames at 30 Hz -
++    // and the game thread blocks on the audio thread once per frame
++    // (docs/frame-map.md), so any frame longer than that empties the queue and
++    // is heard as a click and seen as a hitch at the same instant. 90 ms is
++    // ~2.7 frames.
++    //
++    // 90 is also the CEILING this engine can use, and the clamp is not
++    // cosmetic: SDLAudioPlayer::DoPlay drops anything queued past 6000 samples,
++    // and HandleAudioThread stops producing at `Buffered() > 2 * Desired`. With
++    // Desired above 3000 samples (93.75 ms) that guard sits above the hard
++    // ceiling, never fires, and the queue parks at 6000 samples of latency with
++    // nothing to trim it.
++    //
++    // Read once, here: changing it needs a relaunch (Settings > iOS says so).
++    int32_t pbAudioMs = CVarGetInteger("gSohIos.AudioBufferMs", 90);
++    if (pbAudioMs < 30) {
++        pbAudioMs = 30;
++    }
++    if (pbAudioMs > 90) {
++        pbAudioMs = 90;
++    }
++    const int32_t pbDesiredBuffered = 32000 * pbAudioMs / 1000;
++    SPDLOG_INFO("PB_AUDIO reservoir {} ms = {} samples at 32 kHz", pbAudioMs, pbDesiredBuffered);
++    Ship::Context::GetRawInstance()->InitAudio(
++        { .SampleRate = 32000, .SampleLength = 1024, .DesiredBuffered = pbDesiredBuffered });
++#else
+     Ship::Context::GetRawInstance()->InitAudio({ .SampleRate = 32000, .SampleLength = 1024, .DesiredBuffered = 1680 });
++#endif
+ 
+     // Opt in to texture path memoization.
+     if (gsFast3dWindow != nullptr) {
+@@ -1040,7 +1070,31 @@
+ 
+             bool accepted = AudioPlayerBuffered() >= before + (frameSamples / 2);
+             if (accepted && before == 0) {
++#ifdef __IOS__
++                // PAPERBOAT_IOS (overlay 0026). Two changes, one reason.
++                //
++                // Count it: the perf harness's `underruns` field (overlay 0012
++                // rev2) is what an A/B reads, not a line count in a log file.
++                //
++                // Log at most one a second: release builds run an async logger
++                // with async_overflow_policy::block and flush_on(info) over a
++                // rotating file sink (ship/Context.cpp), so every warning costs
++                // THIS thread a queue push and the worker a file flush - while
++                // the game thread is blocked on this very thread's condition
++                // variable. A burst of underruns was feeding itself.
++                PBIos_PerfNoteUnderrun();
++                {
++                    static std::chrono::steady_clock::time_point sPbLastUnderrunWarn{};
++                    const auto pbNow = std::chrono::steady_clock::now();
++                    if (sPbLastUnderrunWarn.time_since_epoch().count() == 0 ||
++                        std::chrono::duration<double>(pbNow - sPbLastUnderrunWarn).count() >= 1.0) {
++                        sPbLastUnderrunWarn = pbNow;
++                        SPDLOG_WARN("audio queue underran");
++                    }
++                }
++#else
+                 SPDLOG_WARN("audio queue underran");
++#endif
+             }
+         };
+ 

@@ -1,0 +1,204 @@
+Overlay patch 0032 - the two letterboxes overlay 0029 could not reach.
+
+CLASS: (b) upstream bug fix worth sending, same as 0029 and for the same reason:
+it is a rendering correctness fix, and `__IOS__`-gating it would put the macOS
+oracle (the spec's ground truth) permanently out of parity with the phone.
+
+WHAT THE USER STILL SAW ON 0.0.0.9
+--------------------------------
+Overlay 0029 removed the letterbox from the CAMERA (the viewport and the
+scissor). Two other places paint the 4:3 frame by hand, and neither goes through
+the camera, so both survived:
+
+(a) **Outdoor maps still band top and bottom.** `gfx_draw_background`
+    (`src/background_gfx.c`) clamps the backdrop's `backgroundMinY` /
+    `backgroundMaxY` to `camera->viewportStartY .. + viewportH` - the FIELDS,
+    which 0029 deliberately leaves at the map's 20..220 - and then EXPLICITLY
+    fills black above and below them:
+
+        // Black letterbox above/below the play area, full visible width.
+        if (backgroundMinY > 0)               fill(wsLeft, 0, wsRight-1, backgroundMinY-1);
+        if (backgroundMaxY < SCREEN_HEIGHT)   fill(wsLeft, backgroundMaxY, wsRight-1, SCREEN_HEIGHT-1);
+
+    Reached by every map that ships no background header (`world.c:215` calls
+    `set_background_size(..., SCREEN_INSET_X, SCREEN_INSET_Y)`), by every battle
+    (`state_battle.c:191`, same call) and by the pause screen
+    (`state_pause.c:210`), plus any map whose background header starts at row 20.
+    The X axis of the very same block was already widened - `get_cam_frame_x`
+    returns the true screen edges once the view is widened - so this is the
+    identical half-finished widescreen fit 0029 found in the camera, one file
+    over. See MEASURED below: this half is reasoned, not reproduced.
+
+(b) **The map-transition wipe leaves a strip of the old map top and bottom.**
+    `appendGfx_screen_overlay`'s `OVERLAY_VIEWPORT_COLOR` case
+    (`src/screen_overlays.c`) fills from `camera->viewportStartY` to
+    `+ camera->viewportH`, i.e. rows 20..220 of 240, while its X extents are
+    `OTRGetRectDimensionFrom{Left,Right}Edge(0)` - the true widened screen
+    edges. So the fade covers the full width and only the 4:3 height, and 20
+    rows of the outgoing map stay lit at the top and the bottom: 20/240 of a
+    1260 px drawable is ~105 px, which is the strip the user measured at ~75.
+    `OVERLAY_SCREEN_COLOR` immediately above it already fills
+    `0 .. SCREEN_HEIGHT - 1`, which is what the viewport case should do when the
+    viewport IS the screen.
+
+THE FIX
+-------
+One predicate, in `cam_main.c` beside `get_cam_frame_x`, exported like it:
+
+    b32 cam_frame_fills_height(s32 camID);
+
+- true exactly when 0029's own two hunks fire: the view is widened past 4:3,
+  the camera reaches the screen edges, and its viewport is the standard
+  full-size world/battle one (`viewportH >= SCREEN_HEIGHT - 2*SCREEN_INSET_Y`).
+  It is the Y counterpart of `get_cam_frame_x`, and it is written in terms of
+  the same two static predicates 0029 uses, so the three call sites cannot drift
+  apart.
+
+Then (a) lets the backdrop span the full height (which removes both black fills
+by making their conditions false, rather than by deleting them), and (b) fills
+the whole screen.
+
+WHAT IT DELIBERATELY DOES NOT DO
+--------------------------------
+* No camera field is written. `viewportStartY` / `viewportH` still say what the
+  map said, exactly as after 0029.
+* The game's own letterboxes are untouched: the demo camera's 177-tall
+  viewport, the title and file select's 184, the intro's 162, and every
+  `cam_api` viewport a cutscene sets all fail the `viewportH` test, so they
+  still frame themselves. 4:3 and narrower fails `cam_view_is_widened()` and
+  keeps Paper Mario's frame on all four sides.
+* `OVERLAY_SCREEN_COLOR` and the stencil transitions are not touched - they
+  already use the full screen.
+
+MEASURED, ON THE SIMULATOR (lane 2, iPhone Air iOS 27.0)
+--------------------------------------------------------
+The wipe is the case that could be A/B'd, and it is unambiguous. Same fresh
+container, same new game, same automated drive; the patch FILE moved out of
+`overlay/patches/` for the "before" build, because `build-sim.sh` re-applies the
+overlay (D27's methodology note).
+
+BEFORE (`artifacts/sim/m028-g-wipe-BEFORE-105px-strips.png`, the standard
+map-change fade at Mario's house): row-mean brightness over the central columns
+is ~160 for rows 0-105, ~80 for rows 110-1155, ~190 for rows 1160-1259. I.e.
+**a 105 px strip of the outgoing map at the top and a ~100 px strip at the
+bottom are not covered at all**, and 105/1260 = 20/240 = SCREEN_INSET_Y - the
+same constant as D27.
+
+AFTER (`artifacts/sim/m028-h-wipe-AFTER-full-height.png`): the same fade covers
+the frame top to bottom - the median column is dark for all 1260 rows, and the
+9.4 % of the image that is not dark is the UIKit touch overlay, which is not part
+of the game frame at all.
+
+No regression anywhere else: 71 driven gameplay frames across the prologue
+(Mario's house yard, its interior, the castle party) measure 0 px top and bottom
+with the patch in (`m028-i-yard-no-bands.png` is the yard), the title and file
+select still letterbox, and the attract demo still plays on its own stage.
+
+**The outdoor-band case (a) was NOT reproduced on the simulator.** Mario's house
+yard - the map the user's screenshot shows - takes a background path that does not
+hit `gfx_draw_background`'s letterbox fills, and 240 automated frames over two
+builds never produced a banded outdoor frame. The fills are nonetheless the only
+remaining hand-drawn 4:3 frame in the world renderer, they are reached by every
+map that ships no background header (`world.c:215`), by every battle
+(`state_battle.c:191`) and by the pause screen (`state_pause.c:210`), and they
+are the exact same half-finished widescreen fit as the camera's. The hunk is in
+because the code is certainly wrong; which map the user was on is a question for
+his next device run, not a reason to leave it wrong.
+
+WHERE THE HUNKS SIT
+-------------------
+Three files.
+* `src/cam_main.c`: one hunk immediately after `get_cam_frame_x` (~:115
+  pristine). Overlay 0029's two hunks are at ~:163 and ~:229 - clear.
+* `src/background_gfx.c` and `src/screen_overlays.c`: no other patch in the
+  series touches either file.
+* `include/functions.h`: the declaration, beside `get_cam_frame_x` (~:455). No
+  other patch touches this header.
+
+Match-count asserted against the pristine vendor state.
+
+--- a/src/cam_main.c
++++ b/src/cam_main.c
+@@ -114,6 +114,21 @@
+     *right = OTRGetRectDimensionFromRightEdge(SCREEN_WIDTH - endX);
+ }
+ 
++// PAPERBOAT (overlay 0032): the Y counterpart of get_cam_frame_x - true when
++// this camera's content should fill the screen vertically as well as
++// horizontally. It is exactly the condition overlay 0029's viewport and scissor
++// hunks fire on, named once so the places that paint the 4:3 frame BY HAND (the
++// backdrop's black bars in gfx_draw_background, the OVERLAY_VIEWPORT_COLOR
++// wipe) cannot drift away from the camera they are supposed to match.
++//
++// False for every camera the game deliberately letterboxes - the demo's
++// 177-tall viewport, the title and file select's 184, the intro's 162, anything
++// cam_api sets for a cutscene - and false at 4:3 or narrower.
++b32 cam_frame_fills_height(s32 camID) {
++    return cam_view_is_widened() && cam_has_fullscreen_viewport(camID)
++           && gCameras[camID].viewportH >= SCREEN_HEIGHT - 2 * SCREEN_INSET_Y;
++}
++
+ // The world and battle cameras are drawn inside a black margin, but only at 4:3 or narrower:
+ // a wider view has no margin to draw.
+ static b32 cam_is_framed(s32 camID) {
+--- a/include/functions.h
++++ b/include/functions.h
+@@ -453,6 +453,8 @@
+ void set_cam_viewport(s16 id, s16 x, s16 y, s16 width, s16 height);
+ void get_cam_scissor_x(s32 camID, s32* left, s32* right);
+ void get_cam_frame_x(s32 camID, s32* left, s32* right);
++// PAPERBOAT (overlay 0032): the Y counterpart of get_cam_frame_x.
++b32 cam_frame_fills_height(s32 camID);
+ 
+ void disable_player_shadow(void);
+ void move_player(s32 duration, f32 heading, f32 speed);
+--- a/src/background_gfx.c
++++ b/src/background_gfx.c
+@@ -459,6 +459,20 @@
+             }
+ 
+             if (backgroundMaxY > SCREEN_HEIGHT) {
++                backgroundMaxY = SCREEN_HEIGHT;
++            }
++
++            // PAPERBOAT (overlay 0032): a widened view has no margin to draw,
++            // vertically either. The clamps above pin the backdrop to the
++            // camera's 4:3 viewport rows (20..220 on a normal map) and the block
++            // below then paints black over everything outside them - which is
++            // the letterboxing that survived overlay 0029 on any map with a
++            // backdrop, i.e. every outdoor one. The X half of the same block was
++            // already widened to the true screen edges by get_cam_frame_x.
++            // Both black fills below become no-ops once this runs; they are left
++            // in place so a camera that IS letterboxed still gets them.
++            if (cam_frame_fills_height(gCurrentCameraID)) {
++                backgroundMinY = 0;
+                 backgroundMaxY = SCREEN_HEIGHT;
+             }
+ 
+--- a/src/screen_overlays.c
++++ b/src/screen_overlays.c
+@@ -258,8 +258,22 @@
+             gDPSetCombineMode(gMainGfxPos++, G_CC_PRIMITIVE, G_CC_PRIMITIVE);
+             gDPSetPrimColor(gMainGfxPos++, 0, 0, colR, colG, colB, progress);
+             gDPSetScissor(gMainGfxPos++, G_SC_NON_INTERLACE, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+-            gDPFillWideRectangle(gMainGfxPos++, OTRGetRectDimensionFromLeftEdge(0), camera->viewportStartY,
+-                             OTRGetRectDimensionFromRightEdge(0), camera->viewportStartY + camera->viewportH);
++            {
++                // PAPERBOAT (overlay 0032): the map-transition wipe covers the
++                // full WIDTH (the X extents are the true widened screen edges)
++                // and only the 4:3 HEIGHT, so 20 of 240 rows of the outgoing map
++                // stayed lit at the top and the bottom - ~105 px on a 1260 px
++                // drawable. When the camera fills the screen, so does the wipe.
++                s32 wipeTop = camera->viewportStartY;
++                s32 wipeBottom = camera->viewportStartY + camera->viewportH;
++
++                if (cam_frame_fills_height(gCurrentCameraID)) {
++                    wipeTop = 0;
++                    wipeBottom = SCREEN_HEIGHT;
++                }
++                gDPFillWideRectangle(gMainGfxPos++, OTRGetRectDimensionFromLeftEdge(0), wipeTop,
++                                 OTRGetRectDimensionFromRightEdge(0), wipeBottom);
++            }
+             gDPSetColorDither(gMainGfxPos++, G_CD_DISABLE);
+             return;
+     }

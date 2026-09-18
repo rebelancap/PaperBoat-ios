@@ -1,0 +1,45 @@
+# Vendored upstream working tree — reconstructed by scripts/bootstrap.sh
+# (pinned clone with its own .git). The pin lives in bootstrap.sh; local
+# changes live in overlay/patches/.
+vendor/
+
+# Local game data working copy (never commit — large, user-owned)
+work/
+
+# Build outputs
+build*/
+oracle/build/
+spikes/*-build/
+DerivedData/
+.DS_Store
+__pycache__/
+
+# Game data, in every form it takes.
+*.o2r
+*.otr
+*.z64
+*.n64
+*.v64
+*.hts
+*.htc
+oracle/shiphome/
+
+# Captured artifacts — keep the dir, ignore the heavy contents.
+# docs/screenshots/ is the exception: those ARE published.
+artifacts/**/*.png
+artifacts/**/*.jpg
+artifacts/**/*.mov
+artifacts/**/*.mp4
+artifacts/**/*.trace
+artifacts/**/*.log
+artifacts/**/*.ipa
+
+# OTA hosting dir — IPAs with the remote console compiled in; never public.
+ota/
+
+# Release artifacts: scripts/build-release.sh writes
+# release/paperboat-<version>-iOS.ipa here, and scripts/export-public.sh
+# GENERATES release/public/ — the public repo tree, rebuilt from this one on
+# every release. Both are reproducible; the GitHub release and the public repo
+# are where they live, not here.
+release/

@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Overlay patch 0025 - SyncFramerateWithTime's early-wake clamp was dead code.
+
+CLASS: (b) upstream bug fix worth sending.
+
+THE BUG (all platforms, not just iOS)
+-------------------------------------
+`GfxWindowBackendSDL2::SyncFramerateWithTime` sleeps the frame out to its
+deadline and then tries to correct for waking early:
+
+    uint64_t t = qpc_to_100ns(...);
+    const int64_t next = previous_time + 10 * FRAME_INTERVAL_US_NUMERATOR / ...;
+    ...
+    if (left > 0 && t - next < 10000) {
+        t = next;          // "don't let an early wake slow down the framerate"
+    }
+    previous_time = t;
+
+`t` is `uint64_t` and `next` is `int64_t`, so `t - next` is evaluated in
+`uint64_t` (the usual arithmetic conversions pick the unsigned type at equal
+rank). The ONLY case the clamp was written for is waking EARLY, i.e. `t < next`
+- and in that case `t - next` wraps to something near 2^64, the `< 10000` test
+is false, and the correction never happens. The clamp is dead code on every
+platform; on Apple it is dead on every single frame, because the `__APPLE__`
+branch above deliberately subtracts 1 ms from the sleep and (unlike `_WIN32`)
+has no busy-wait to make it up.
+
+Consequence: `previous_time` is set to a wake time ~1 ms before the deadline,
+every frame, so the NEXT deadline is computed from a base 1 ms early. The pacer
+therefore free-runs at `interval - 1 ms` instead of `interval` - it is not a
+cumulative drift (the base is re-measured each frame) but it does mean the
+engine's software pacer and the display's vsync are asking for two different
+cadences, and frames land on either side of the boundary. That is visible as
+`eng_ms p50 32.1` against `wall_ms p50 33.33` in this port's own measurements
+(the measurement log M-013 / M-022): the sleep ends ~1.2 ms before the frame does.
+
+The fix is one cast. `(int64_t)t - next < 10000` makes the early-wake case
+negative, the clamp fires, and `previous_time` lands on the deadline the way
+the comment says it should.
+
+THE SECOND HALF THAT WAS *NOT* SHIPPED: "one pacer, the display's"
+-------------------------------------------------------------------
+The round-13 brief also called for skipping the nanosleep entirely on iOS when
+vsync is on, on the family principle that the display should be the only pacer:
+`nextDrawable()` blocks on the compositor, `presentDrawable` lands on a vsync
+boundary, and `SetMaxFrameLatency` is a no-op here ("Not supported by SDL :(").
+
+It was written, gated on the only case where the two pacers can agree
+(`mVsyncEnabled && mTargetFps >= the display's refresh rate` - PM64 targets 30,
+so below the refresh rate the sleep is load-bearing or the game runs at double
+speed), built, and **measured on the simulator - where it made the game run at
+1.58x speed**. With `gSettings.InterpolationFPS 60` on a panel SDL reports as
+60 Hz, the `fps` verb read `fps=109.8  tps=47.52/30` (the measurement log M-025): the
+CAMetalLayer did not pace at all, so nothing did.
+
+That is the exact hazard the gate was supposed to exclude, arriving through the
+other door - the refresh rate SDL reports is not the rate the drawable queue
+actually enforces. It was removed rather than re-gated: a mis-paced frame
+driver is a whole-game bug, the evidence that the drawable paces on iOS is now
+absent rather than merely unproven, and the stutter this round was chasing has
+a measured cause elsewhere (the 52.5 ms audio reservoir - overlay 0026). Any
+future attempt needs a DEVICE measurement of what the drawable queue does on
+its own, not an inference from the family.
+
+UPSTREAMABLE: yes, unreservedly. It is a plain bug on every platform, it is one
+cast, and the fix is exactly what the existing comment already claims happens.
+"""
+import subprocess, pathlib, tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VENDOR = ROOT / "vendor/PaperBoat"
+OUT = ROOT / "overlay/patches/0025-lus-sdl2-pacer-unsigned-compare.patch"
+
+REL = "external/libultraship/src/fast/backends/gfx_sdl2.cpp"
+
+
+def replace_once(t, old, new, tag):
+    n = t.count(old)
+    assert n == 1, f"{REL}: expected 1 match of {tag}, got {n}"
+    return t.replace(old, new, 1)
+
+
+src = VENDOR / REL
+orig = src.read_text()
+text = orig
+
+# ---------------------------------------------------------------------------
+# The unsigned compare -- the whole patch.
+# ---------------------------------------------------------------------------
+OLD_CLAMP = """    if (left > 0 && t - next < 10000) {
+        // In case it takes some time for the application to wake up after sleep,
+        // or inaccurate mTimer,
+        // don't let that slow down the framerate.
+        t = next;
+    }
+"""
+NEW_CLAMP = """    // NOTE (overlay 0025): the cast is the fix. `t` is uint64_t and `next` is
+    // int64_t, so `t - next` was evaluated UNSIGNED - and the only case this
+    // clamp exists for is waking EARLY (t < next), which wrapped to ~2^64 and
+    // failed the test every time. The clamp was dead code on every platform,
+    // and dead on every frame on Apple, where the branch above deliberately
+    // wakes 1 ms early and has no busy-wait to make it up.
+    if (left > 0 && (int64_t)t - next < 10000) {
+        // In case it takes some time for the application to wake up after sleep,
+        // or inaccurate mTimer,
+        // don't let that slow down the framerate.
+        t = next;
+    }
+"""
+text = replace_once(text, OLD_CLAMP, NEW_CLAMP, "early-wake clamp")
+
+with tempfile.NamedTemporaryFile("w", suffix=".a", delete=False) as fa, \
+     tempfile.NamedTemporaryFile("w", suffix=".b", delete=False) as fb:
+    fa.write(orig); fb.write(text); fa.flush(); fb.flush()
+    r = subprocess.run(["diff", "-u", "--label", f"a/{REL}", "--label", f"b/{REL}",
+                        fa.name, fb.name], capture_output=True)
+assert r.returncode == 1, "diff produced no change"
+
+OUT.write_text(__doc__ + "\n" + r.stdout.decode())
+print(f"wrote {OUT}")

@@ -1,0 +1,64 @@
+Overlay patch 0034 - the screen framebuffer stops LOADING a depth buffer
+nobody wrote.
+
+CLASS: (b) upstream bug fix (JeodC/libultraship, and the same three lines are in
+Kenix3/libultraship). Not iOS-gated - the macOS oracle must render identically.
+
+`SetupScreenFramebuffer` builds framebuffer 0's render pass descriptor from
+scratch every frame, because the colour attachment IS the drawable's texture and
+the drawable rotates. The depth attachment is a private texture that is kept
+across frames, and its load action is `LoadActionLoad`.
+
+There is nothing to load. Nothing outside the frame writes that depth texture,
+and the contents that survive are from a DIFFERENT drawable's frame - the screen
+pass is the final composite plus ImGui, which is drawn with depth testing off
+(and `SetupFloatingFrame` detaches the depth attachment for ImGui outright). So
+the load is a full read of the attachment for data that is meaningless when it
+arrives: 2736x1260 x 4 B = 13.8 MB per frame at the iPhone Air's native drawable,
+1.7 GB/s of pure waste at 120 Hz.
+
+`LoadActionClear` (the descriptor already sets `clearDepth(1)`, which was dead
+code until now) reads nothing at all: on a TBDR GPU a clear is resolved in tile
+memory. Behaviour is strictly more defined than before, not less - a depth test
+on the screen pass now sees a cleared buffer instead of whatever the previous
+drawable left.
+
+THE COMPANION RULE, AND THE BUG IT PREVENTS. Framebuffer 0 is not always just
+the composite: at SSAA 1.0 with MSAA off and no post passes, `mRendersToFb` is
+false (`interpreter.cpp:7126`) and PM64 draws depth-tested scene geometry
+straight into it. A mid-frame render-pass restart there must therefore LOAD the
+depth this descriptor now says to Clear. Overlay 0033 rev 2 owns that rule: a
+deferred RESTART forces `LoadActionLoad` on colour and depth, only the frame's
+FIRST pass uses the descriptor as it stands. Reviewing 0.0.0.11 caught this
+before a device did; without it, every depth-tested draw after the per-frame
+`gDPCopyFB` tested against far at SSAA 1.0 and nowhere else.
+
+The STORE action is deliberately left alone. `DontCare` there would save the
+write as well, but `CopyFramebuffer` / `SelectTextureFb` / `PbEnsureEncoder`
+(overlay 0033) all re-open a pass with `LoadActionLoad` on depth, so a
+`DontCare`d store would hand a mid-frame restart undefined depth. Doing that
+safely means per-encoder `StoreActionUnknown` plumbing at every restart site,
+which is a bigger change than this round's measurement justifies - recorded in
+the design notes D29 as the next step if depth bandwidth ever shows up in a profile.
+
+Measured motivation: the design notes D28 §2 / D29, and the user's device read of
+`gpu_game_ms p50 8.60..14.50` at 2x supersampling.
+
+--- a/external/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/external/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -917,7 +917,14 @@
+     }
+ 
+     render_pass_descriptor->depthAttachment()->setTexture(fb.mDepthTexture);
+-    render_pass_descriptor->depthAttachment()->setLoadAction(MTL::LoadActionLoad);
++    // PAPERBOAT (overlay 0034): CLEAR, not Load. The colour attachment of this
++    // pass is the drawable, which rotates; the depth texture persists, so a Load
++    // here reads back a different frame's depth - 13.8 MB at a 2736x1260
++    // drawable, every frame, for data nothing can use. The screen pass is the
++    // final composite plus ImGui and does not depth-test against it (and
++    // SetupFloatingFrame detaches depth for ImGui entirely). clearDepth(1) below
++    // was already set and until now was dead.
++    render_pass_descriptor->depthAttachment()->setLoadAction(MTL::LoadActionClear);
+     render_pass_descriptor->depthAttachment()->setStoreAction(MTL::StoreActionStore);
+     render_pass_descriptor->depthAttachment()->setClearDepth(1);
+ 

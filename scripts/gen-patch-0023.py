@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""Overlay patch 0023 - Max Frame Rate caps the ENGINE.
+
+CLASS: (a) program-baseline parity. The engine half of the "Max Frame Rate"
+combobox overlay 0021 adds (checklist row 6); cross-port adoption of
+Lighthouse's 0040.
+
+WHAT `GetInterpolationFPS()` DOES, AND HOW THE UPSTREAM KNOBS INTERACT
+---------------------------------------------------------------------
+It decides how many frames the engine renders per 30 Hz game tick
+(`GameEngine::RunCommands` expands one tick into that many interpolated
+sub-frames). Upstream's chain, in order:
+
+  1. `gSettings.MatchRefreshRate` (default **0** on this port - the widget in
+     Settings > Graphics ships no DefaultValue) -> follow the window's reported
+     refresh rate, and the "Current FPS" slider is greyed out.
+  2. else, vsync on (default) or vsync not disableable ->
+     `min(refreshRate, gSettings.InterpolationFPS)`.
+  3. else -> `gSettings.InterpolationFPS` raw.
+
+`InterpolationFPS` defaults to 30 upstream, so out of the box PaperBoat targeted
+30 and Max Frame Rate was a ceiling nothing pushed against. The user's 0.0.0.8
+report - "Performance HUD shows 30 fps when max fps is 120" - is exactly that.
+
+REV 2 (round 15): on iOS the DEFAULT for `InterpolationFPS` is the display's own
+refresh rate instead of 30, bounded to [30, 240] with a 60 fallback. So the
+chain out of the box is:
+
+  1. `MatchRefreshRate` (0) -> not taken;
+  2. vsync on (the default) -> `min(refresh, InterpolationFPS default = refresh)`
+     = the refresh rate;
+  3. then the Max Frame Rate cap below.
+
+A fresh install therefore runs at 60 on a 60 Hz panel and at 120 on ProMotion
+with the cap at 120 (which also needs `CADisableMinimumFrameDuration` - overlay
+0030). A value the player HAS set still wins: only the default moved, so no
+upstream CVar changes meaning and no persisted desktop value churns.
+
+WHY IT HAS TO BE HERE AND NOT ONLY IN THE SHELL
+-----------------------------------------------
+The sibling ports drive a CADisplayLink from the shell and cap it there. This
+port does not own the frame driver at all - SDL does (the design notes D6) - so the
+engine-side clamp is the ONLY place the choice can land. Capping presentation
+without capping interpolation would in any case be the worst of both: the
+engine would still expand every tick into sub-frames for 120 and the display
+link would throw half of them away.
+
+VALUE-KEYED CVar (60 / 120), matching overlay 0021's combo map and the shell.
+Floored at 30 so a corrupt or stale value can never stall the engine.
+
+REV 3 (round 16): TWO CHANGES, one of which is a safety net against the worst
+bug this port has had.
+
+(1) THE REFRESH RATE COMES FROM UIKIT ON iOS. `PBIos_MaxFramesPerSecond()` (the
+shell) returns `UIScreen.maximumFramesPerSecond` for the app's own scene. SDL's
+display mode already reports the same number on iOS
+(`SDL_uikitmodes.m:251` -> `uiscreen.maximumFramesPerSecond`), so this is not a
+behaviour change so much as making the source explicit, independent of SDL having
+a window yet, and PRINTABLE - the bridge's new `refresh` verb prints the panel
+rate, the target the engine settled on, and the step-down flag together, which is
+the read that would have caught the 0.0.0.9 bug in ten seconds. A diagnostic
+override, `gSohIos.RefreshOverride` (0 = off), forces the rate the whole chain
+uses; it exists because the 60 Hz SIMULATOR otherwise cannot be made to run a
+120 target at all (upstream's vsync branch clamps the target to the refresh
+rate), and it is how the step-down below is verified without a ProMotion panel.
+
+(2) THE TARGET NEVER OUTRUNS THE PRESENTS - an auto-step-down. The user's 0.0.0.9
+device read:
+
+    wall_ms p50=16.69 ... ipf=4.00 tps=14.99/30 ... underruns=961
+
+The interpolation target was 120 (ipf 4 = 120/30) and the presents were locked at
+60. The engine expands one 30 Hz tick into 4 sub-frames and presents them one per
+vsync, so at 60 presents/s the GAME ADVANCES 15 TIMES A SECOND - **half speed** -
+and the audio thread starves behind it, because each tick produces 33 ms of audio
+while 66 ms of wall time elapse (961 underruns).
+
+That is a whole class of bug: any time the display cannot keep up with the target,
+this engine slows the GAME down rather than dropping frames. So the target now
+follows the achieved present rate. Using overlay 0012 rev 3's present ring, if
+the median present period over the last ~1 s exceeds **1.4x** the target period,
+the target steps down to the next divisor of the refresh rate (120 -> 60 -> 30,
+floored at 30), logs once, and stays there: it steps back up only on a relaunch
+or when SSAA / Max Frame Rate changes (the two settings that change the cost of a
+frame). A cooldown of 80 presents after each step keeps it from deciding twice on
+the same second of history.
+
+It is a SAFETY NET, not the plan. The user, round 16: "why can i get 2x SSAA and
+120 fps on more intense games like the zelda ports? the solution here shouldn't be
+dialing it back" - and he is right: the 60 Hz lock on 0.0.0.9 was not GPU
+starvation, it was **overlay 0030 shipping the iPad ProMotion plist key instead of
+the iPhone one** (`CADisableMinimumFrameDuration` vs
+`CADisableMinimumFrameDurationOnPhone`; 0030 rev 2 ships both). With the panel
+actually running at 120 the step-down should never fire on his phone. If it does,
+it means the frame genuinely costs more than 8.33 ms and the right answer is to
+find out why (D28), not to ship half-speed gameplay in the meantime.
+
+REV 4 (round 17): THE SAFETY NET DID FIRE ON HIS PHONE, AND IT NEVER LET GO.
+
+The user, on 0.0.0.10: "the game ran at 120 for a few minutes, then locked to 60
+and stayed there". The bridge read confirms it - `refresh=120 target=60
+stepdown=1`, with `gpu_game_ms p50=8.60..14.50 p95=22.5` at 2x supersampling
+(5472x2520) and thermal 0 throughout. So the step-down fired legitimately (the
+game pass really does exceed the 8.33 ms budget at 2x on some scenes), and then
+rev 3's latch made a transient permanent. Two bugs, both fixed here.
+
+(1) THE RESET DID NOT RESET. Changing SSAA over the bridge is meant to clear the
+latch. It cleared `sSteps`, but `PBIos_PerfPresentPeriod` still reported the
+~1 s window of 60 Hz presents made under the OLD target, so the step-down
+condition was true again on the very same call and re-latched instantly. Rev 4
+arms a **120-present cooldown** (the p50 window is ~1 s; 120 presents is >= 1 s
+at 60 Hz) at startup, on every reset, and after every step in either direction.
+No decision is ever taken on presents from before the previous decision.
+
+(2) IT NEVER STEPPED BACK UP. A room load, a shader-compile burst or one heavy
+scene cost 120 Hz for the rest of the session. Rev 4 adds a step-UP: every
+`retry_s` seconds (10 s to start) while stepped down, read overlay 0012 rev 4's
+`gpu_game_ms` p95 over the frame ring; if it is under **0.75x the HIGHER
+target's period** (6.25 ms for 120) the target climbs one level, logs, and
+re-arms the cooldown. The GAME's GPU price is the right input and the present
+period is not: while stepped down the presents are pacing perfectly at the lower
+target, which says nothing about whether the higher one would fit.
+
+ANTI-OSCILLATION: a step-down within 30 s of a step-up doubles `retry_s`
+(10 -> 20 -> 40 -> 80 -> 120 s cap), so a frame sitting exactly on the budget
+line settles instead of flickering 60/120 in front of the player.
+
+The bridge's `refresh` line gains `stepups=` and `retry_s=` and keeps every
+field it had, in order (docs/console-bridge.md).
+
+REV 5 (round 20): IT COST HIM 120 Hz AGAIN, SO THE INPUT CHANGES.
+
+The user's 0.0.0.14 read (M-032 §1), ~30 s after launch, 2x SSAA, 120 Hz panel:
+
+    refresh=120 target=60 stepdown=1 stepups=0 retry_s=10 present_p50_ms=16.68
+    wall_ms p50=16.62 p95=17.46 max=21110.52 | gpu_game_ms p50=6.53 p95=9.96
+    fps=17.4 tps=26.50 ipf=0.66 | tick_max=25.5 loop_max=21139.2 holds=30
+
+`max=21110` and `loop_max=21139`: ONE twenty-one-second loop period at launch -
+a load, or a resume - and rev 4's step-down, which reads only the median present
+period over the following second, fired on its wake. Then the step-up could not
+happen either: the gate was gpu_game_ms p95 < 0.75x the higher period (6.25 ms
+at 120) and the honest p95 at 2x is 7.1-7.4 ms. So the phone sat at 60 Hz for
+minutes, `stepups=0`, until `set gSohIos.Supersample` reset it from the Mac.
+Everything else in that read is good news - at target 120 and 2x the same scene
+runs `wall_ms p50=8.33 p95=8.50-9.36`, `gpu_game_ms p50=6.0 p95=7.3`,
+`fps=117.7-120.0`, `tps=30.0`: 0033/0034/0036 made 120 at 2x fit.
+
+WHAT REV 5 MEASURES. Since overlay 0012 rev 5 a late present drops an
+intermediate interpolated view instead of delaying the next tick, so the present
+period is no longer a harm at all. The harm is `tps` falling - the game running
+slow - and that now means the sub-frame skip itself cannot keep up. So the
+step-down needs, over a 3 s window: tps below 27/30 AND the skip counter rising,
+for TWO consecutive windows. And a window containing a held frame (`holds`
+changed - PM64 holds frames across map transitions), a present or loop period
+over 250 ms, or fewer than 60 presents is discarded rather than voted on, which
+is precisely what the 21 s stall would have hit. Nothing is decided in the first
+5 s after launch, after a resume (overlay 0008's flag) or after any step.
+
+The step-up gate becomes tps >= 29.0 with gpu_game_ms p95 under 0.95x the higher
+target's period (7.92 ms at 120), for 10 s of clean windows; 0.75x was a
+headroom guess made before a 2x device read existed, and 0012 rev 5 is what
+absorbs the p99 now. The retry_s backoff is unchanged.
+
+THE TWO VOTES ARE DELIBERATELY ASYMMETRIC. The hold and spike guards apply to
+the step-DOWN only. The first cut of rev 5 required a clean window for both, and
+the simulator showed within a minute what that means: PM64 holds a frame every
+second or two in the attract demo, so every window was discarded and a target
+stepped down to 30 could never climb back - the exact "never lets go" failure
+rev 4 existed to fix. A step-up needs no such guard, because its own condition
+(10 s of clean windows at tps >= 29.0) is one no load can satisfy.
+
+The gate was briefed as 29.5 and is 29.0 because the simulator said so: at a
+stepped-down target the tick period is set by SDL's nanosleep pacer, which can
+only overshoot 33.33 ms, so a healthy 30 Hz target reads a little under 30.0 -
+29.4 on the simulator, with nothing wrong with it and no way back up past 29.5.
+29.0/30 is 96.7 % speed and still leaves a two-tick dead band above the 27.0
+down-vote.
+
+The evidence comes from overlay 0012 rev 6's `PBIos_PerfStepWindow` - one locked
+window, so tps, the counters and the maxima all describe the same stretch of wall
+time. The `refresh` line gains `reason=`, the last decision or discarded window
+(`startup`, `reset`, `resume`, `window_held`, `window_spike`, `tps_slow`,
+`gpu_and_tps_fit`), and the last CLOSED window's own numbers: `win_tps`,
+`win_presents`, `win_maxpresent_ms`, `win_maxloop_ms`, `win_held`, plus
+`up_credit_s` (seconds of clean window credit toward a step-up) and
+`bad_windows` (the down-vote streak). Without those the policy is a black box - a step-up whose evidence
+never holds looks exactly like one that is broken.
+
+Inert off iOS.
+
+WHERE THE HUNK SITS
+-------------------
+One hunk, in `GameEngine::GetInterpolationFPS` (~:994 of the pristine file).
+Overlay 0022's hunk is at ~:357, overlay 0004's at ~:190 and overlay 0012's
+three at ~:1137+. No shared context.
+
+Match-count asserted against the pristine vendor state.
+"""
+import subprocess, pathlib, tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VENDOR = ROOT / "vendor/PaperBoat"
+REL = "src/port/Engine.cpp"
+OUT = ROOT / "overlay/patches/0023-paperboat-ios-maxfps-caps-engine.patch"
+
+src = VENDOR / REL
+orig = src.read_text()
+text = orig
+
+
+def replace_once(t, old, new, tag):
+    n = t.count(old)
+    assert n == 1, f"{REL}: expected 1 match of {tag}, got {n}"
+    return t.replace(old, new)
+
+
+OLD = """uint32_t GameEngine::GetInterpolationFPS() {
+    if (CVarGetInteger(CVAR_SETTING("MatchRefreshRate"), 0)) {
+        return Ship::Context::GetRawInstance()->GetWindow()->GetCurrentRefreshRate();
+    }
+
+    if (CVarGetInteger(CVAR_VSYNC_ENABLED, 1)
+        || !Ship::Context::GetRawInstance()->GetWindow()->CanDisableVerticalSync())
+    {
+        return std::min<uint32_t>(
+            Ship::Context::GetRawInstance()->GetWindow()->GetCurrentRefreshRate(),
+            CVarGetInteger(CVAR_SETTING("InterpolationFPS"), 30)
+        );
+    }
+    return CVarGetInteger(CVAR_SETTING("InterpolationFPS"), 30);
+}
+"""
+
+NEW = """#ifdef __IOS__
+// PAPERBOAT_IOS (overlay 0023 rev 3) - the interpolation target, and the two
+// things that keep it honest on a phone.
+//
+// The shell: UIScreen.maximumFramesPerSecond for the app's own scene, 60 when
+// UIKit has nothing sane to say.
+extern "C" int PBIos_MaxFramesPerSecond(void);
+// Overlay 0012 rev 3, defined further down this file: the median present period
+// over the most recent ~1 s (0 until a full second is in hand) and the total
+// present count, which the step-down uses as its cooldown clock.
+extern "C" int PBIos_PerfPresentPeriod(double* p50Ms);
+// Overlay 0012 rev 4: gpu_game_ms p95 over the frame ring (~8.5 s), in ms, or 0
+// for "no verdict". The step-UP below will not fire on anything else - a target
+// may only climb back when the GAME's own GPU price fits the higher period.
+extern "C" double PBIos_PerfGpuGameP95(void);
+// Overlay 0012 rev 6: one locked window of evidence - tick rate, the cumulative
+// hold and sub-frame-skip counters, and the largest present and loop period in
+// it. Returns the total present count. This is what rev 5's policy decides on.
+extern "C" int PBIos_PerfStepWindow(double windowMs, double* tps, double* presentMaxMs, double* loopMaxMs,
+                                    unsigned int* holds, unsigned int* subSkips);
+// Overlay 0008's flag: no step decision is taken across a resume.
+extern "C" int PBIos_IsBackgrounded(void);
+
+// Published for the bridge's `refresh` verb. Writer and reader are both the
+// main thread on iOS (SDL_main and therefore the game loop run there, and every
+// bridge command is hopped onto the main queue), so plain ints are enough.
+static int gPbRefreshHz = 0;
+static int gPbInterpTarget = 0;
+static int gPbStepDown = 0;
+static int gPbStepUps = 0;
+static double gPbRetryS = 0.0;
+// REV 5: what the last decision (or non-decision) was, for the bridge line,
+// plus the last CLOSED window's own numbers. Without these the policy is a
+// black box: `reason=window_held` says a window was discarded but not what it
+// measured, and a step-up that never fires looks identical to one whose
+// evidence never held. They are what turned test (c) from "it does not work"
+// into a number (M-032 §3).
+static const char* gPbStepReason = "none";
+static double gPbWinTps = 0.0;
+static int gPbWinPresents = 0;
+static double gPbWinMaxPresentMs = 0.0;
+static double gPbWinMaxLoopMs = 0.0;
+static int gPbWinHeld = 0;
+static int gPbUpOkS = 0;   // seconds of CLEAN window credit toward a step-up
+static int gPbBadWindows = 0;
+
+extern "C" int PBIos_RefreshReport(char* out, int cap) {
+    if (out == nullptr || cap <= 0) {
+        return 0;
+    }
+    double p50 = 0.0;
+    const int presents = PBIos_PerfPresentPeriod(&p50);
+    return snprintf(out, (size_t)cap,
+                    "refresh=%d target=%d stepdown=%d stepups=%d retry_s=%.0f screen_max=%d "
+                    "present_p50_ms=%.2f presents=%d reason=%s win_tps=%.2f win_presents=%d "
+                    "win_maxpresent_ms=%.0f win_maxloop_ms=%.0f win_held=%d up_credit_s=%d bad_windows=%d",
+                    gPbRefreshHz, gPbInterpTarget, gPbStepDown, gPbStepUps, gPbRetryS,
+                    PBIos_MaxFramesPerSecond(), p50, presents, gPbStepReason, gPbWinTps, gPbWinPresents,
+                    gPbWinMaxPresentMs, gPbWinMaxLoopMs, gPbWinHeld, gPbUpOkS, gPbBadWindows);
+}
+#endif
+
+uint32_t GameEngine::GetInterpolationFPS() {
+    uint32_t pbRefresh = Ship::Context::GetRawInstance()->GetWindow()->GetCurrentRefreshRate();
+    // Upstream's default interpolation target, on every platform but iOS.
+    int32_t pbInterpDefault = 30;
+#ifdef __IOS__
+    // PAPERBOAT_IOS (overlay 0023 rev 2): on iOS the DEFAULT target is the
+    // display's own refresh rate, not 30.
+    //
+    // The user, on 0.0.0.8: "Performance HUD shows 30 fps when max fps is 120."
+    // Max Frame Rate is a CAP; what the engine actually aims at is this
+    // function, and upstream's chain lands on InterpolationFPS = 30 out of the
+    // box (MatchRefreshRate ships no DefaultValue, so it is 0). A phone that
+    // can do 60 or 120 therefore shipped rendering 30 and the HUD said so. The
+    // siblings all render at the display rate by default; this is how PaperBoat
+    // joins them without changing an upstream CVar's meaning - the default a
+    // player has never touched moves, a value they HAVE set still wins.
+    //
+    // REV 3: the rate itself comes from UIKit, with a diagnostic override. The
+    // override is the only way to run a 120 target on the 60 Hz simulator -
+    // upstream's vsync branch below clamps the target to the refresh rate - and
+    // it is therefore how the step-down is verified without a ProMotion panel.
+    {
+        const int32_t pbOverride = CVarGetInteger("gSohIos.RefreshOverride", 0);
+        const int pbScreenMax = PBIos_MaxFramesPerSecond();
+        if (pbOverride >= 30 && pbOverride <= 240) {
+            pbRefresh = (uint32_t)pbOverride;
+        } else if (pbScreenMax >= 30 && pbScreenMax <= 240) {
+            pbRefresh = (uint32_t)pbScreenMax;
+        } else if (pbRefresh < 30 || pbRefresh > 240) {
+            pbRefresh = 60; // the window has not reported a sane rate yet
+        }
+        pbInterpDefault = (int32_t)pbRefresh;
+    }
+#endif
+
+    uint32_t pbFps;
+    if (CVarGetInteger(CVAR_SETTING("MatchRefreshRate"), 0)) {
+        pbFps = pbRefresh;
+    } else if (CVarGetInteger(CVAR_VSYNC_ENABLED, 1)
+               || !Ship::Context::GetRawInstance()->GetWindow()->CanDisableVerticalSync())
+    {
+        pbFps = std::min<uint32_t>(pbRefresh, CVarGetInteger(CVAR_SETTING("InterpolationFPS"), pbInterpDefault));
+    } else {
+        pbFps = CVarGetInteger(CVAR_SETTING("InterpolationFPS"), pbInterpDefault);
+    }
+
+#ifdef __IOS__
+    // PAPERBOAT_IOS (overlay 0023): apply the user's Max Frame Rate choice
+    // (overlay 0021, Settings > iOS > Display) to the ENGINE. This port does
+    // not own the frame driver - SDL does (D6) - so there is no display link to
+    // cap instead, and capping presentation alone would only make the engine
+    // interpolate sub-frames that get thrown away. VALUE-keyed CVar: it holds a
+    // real frame rate (60 / 120), which is what the combo map writes. Floored
+    // at 30 so a corrupt or stale value cannot stall the engine.
+    {
+        int32_t pbCap = CVarGetInteger("gSohIos.MaxFps", 120);
+        if (pbCap < 30) {
+            pbCap = 30;
+        }
+        if (pbFps > (uint32_t)pbCap) {
+            pbFps = (uint32_t)pbCap;
+        }
+    }
+
+    // PAPERBOAT_IOS (overlay 0023 REV 5): MEASURE THE HARM, NOT THE SYMPTOM.
+    //
+    // Rev 4 stepped the target down when the median PRESENT PERIOD exceeded
+    // 1.4x the target period. That was the right reading of the engine as it
+    // stood: one 30 Hz tick was expanded into target/30 sub-frames and the tick
+    // could not end until the last was presented, so a display that could not
+    // keep up made the GAME run slow. Overlay 0012 rev 5 removed that coupling -
+    // an intermediate sub-frame already past the end of its slot is now never
+    // built - and with it the meaning of a late present. A late present costs
+    // one interpolated view. It is not a harm.
+    //
+    // It cost the user 120 Hz twice anyway. On 0.0.0.14 the step-down fired 38 s
+    // after launch on ONE 21-SECOND LOOP PERIOD (`loop_max=21139`, M-032 §1) -
+    // a load or a resume, not a slow frame - and then rev 4's step-up gate
+    // (gpu_game_ms p95 < 6.25 ms) could not be met at 2x supersampling, where
+    // the honest p95 is ~7.3 ms. The phone sat at 60 for the rest of the
+    // session until a CVar write reset it. Second time a step-down policy has
+    // done this, so rev 5 changes what is measured, not the thresholds.
+    //
+    // THE HARM IS `tps`. The only thing left that hurts the player is the game
+    // advancing slower than 30 ticks a second, and that now means the sub-frame
+    // skip itself cannot keep up. So:
+    //
+    // STEP DOWN when, over a 3 s window, the tick rate is below 27/30 AND the
+    // skip counter is rising - for TWO consecutive windows. Both conditions
+    // matter: a low tps with no skips means the stall is somewhere the schedule
+    // cannot see (and halving the target would not help), while skips with a
+    // healthy tps are the mechanism working as designed.
+    //
+    // A WINDOW IS THROWN AWAY, NOT VOTED ON, IF IT CONTAINS A LOAD. Any held
+    // frame (`holds` changed - GLOBAL_OVERRIDES_DISABLE_DRAW_FRAME, which is
+    // how PM64 covers map transitions), any present or loop period over 250 ms,
+    // or fewer than 60 presents, and the window says nothing - and clears the
+    // streak, because a 6 s verdict must be 6 s of comparable play. Nothing is
+    // decided in the first 5 s after launch, after a resume (overlay 0008's
+    // flag), or after any step or reset.
+    //
+    // A DISCARDED WINDOW DOES NOT RESET THE STEP-UP, and that asymmetry is the
+    // other half of the fix. The step-up needs 10 s of CLEAN windows that met
+    // its condition, accumulated as CREDIT: a clean window that fails wipes the
+    // credit, a discarded one leaves it alone. Run as a continuous 10 s timer
+    // instead it never completed on the simulator - the attract demo changes
+    // scene every 10-20 s and reset it at 9 s twice running (M-032 §3), which
+    // is rev 3's permanent latch all over again, just slower.
+    //
+    // 29.0 rather than 30.0 because the pacer sets the tick period at a stepped
+    // target and a nanosleep pacer only ever overshoots; see kPbTpsUp below.
+    //
+    // STEP UP when, at the stepped target, tps >= 29.0 AND gpu_game_ms p95 is
+    // under 0.95x the HIGHER target's period (7.92 ms for 120), for 10 s of
+    // clean windows. Rev 4's 0.75x was a headroom guess made before any 2x device
+    // read existed; the measured 7.3 ms passes 0.95x and fails 0.75x, and
+    // 0012 rev 5 is what absorbs the p99 now. The anti-oscillation backoff is
+    // unchanged: a step-down within 30 s of a step-up doubles retry_s
+    // (10 -> 20 -> ... -> 120 s cap) and a step-up may not fire before it.
+    {
+        using PbClock = std::chrono::steady_clock;
+        const float pbSsaa = CVarGetFloat("gSohIos.Supersample", 0.0f);
+        const int32_t pbMaxFps = CVarGetInteger("gSohIos.MaxFps", 120);
+
+        const double kPbWindowMs = 3000.0;  // one window of evidence
+        const int kPbMinPresents = 60;      // ...or the window says nothing
+        const double kPbSpikeMs = 250.0;    // a load, a resume, a transition
+        const double kPbTpsDown = 27.0;     // of PM64's native 30
+        // 29.0, not 29.5, and the simulator is why (M-032 §3, test (c)). At a
+        // STEPPED-DOWN target the SDL pacer is what sets the tick period, and a
+        // nanosleep pacer can only ever overshoot 33.33 ms, never undershoot -
+        // so a perfectly healthy 30 Hz target measures a little under 30.0 by
+        // construction. The simulator sat at 29.4 with nothing wrong with it
+        // and could never have climbed back past a 29.5 gate. 29.0/30 is 96.7 %
+        // speed, still a wide dead band above the 27.0 down-vote, so the two
+        // cannot chase each other.
+        const double kPbTpsUp = 29.0;
+        const double kPbUpFactor = 0.95;    // of the higher target's period
+        const double kPbUpHoldS = 10.0;
+        const double kPbQuietS = 5.0;       // after launch, a resume, any step
+
+        static uint32_t sBase = 0;
+        static float sSsaa = -1.0f;
+        static int32_t sMaxFps = -1;
+        static int sSteps = 0;
+        static int sStepUps = 0;
+        static double sRetryS = 10.0;
+        static PbClock::time_point sNextUpCheck{};
+        static PbClock::time_point sLastStepUp{};
+        static bool sHaveStepUp = false;
+        // The window: opened here, closed kPbWindowMs later, differenced
+        // against the cumulative counters it was opened on.
+        static PbClock::time_point sWinStart{};
+        static int sWinPresents0 = 0;
+        static unsigned int sWinHolds0 = 0;
+        static unsigned int sWinSubSkip0 = 0;
+        static int sBadWindows = 0;
+        // Step-up CREDIT, in milliseconds of CLEAN window that met the up
+        // condition. Not a continuous timer: a window discarded as a load
+        // neither adds credit nor resets it, so a map transition every few
+        // seconds cannot stop the target ever climbing back - which is what a
+        // continuous 10 s timer did on the simulator (M-032 §3).
+        static double sUpCreditMs = 0.0;
+        static PbClock::time_point sQuietUntil{};
+        static bool sWasBackgrounded = false;
+        static bool sFirstCall = true;
+
+        const PbClock::time_point pbNow = PbClock::now();
+        const auto pbQuiet = std::chrono::milliseconds((long long)(kPbQuietS * 1000.0));
+        const auto pbRetry = std::chrono::milliseconds((long long)(sRetryS * 1000.0));
+
+        double pbTps = 0.0, pbPresentMax = 0.0, pbLoopMax = 0.0;
+        unsigned int pbHolds = 0, pbSubSkip = 0;
+        const int pbPresents =
+            PBIos_PerfStepWindow(kPbWindowMs, &pbTps, &pbPresentMax, &pbLoopMax, &pbHolds, &pbSubSkip);
+
+        // Start a fresh window from NOW, discarding any streak: used at launch,
+        // on a resume, on a reset and after every step.
+        auto pbArmWindow = [&]() {
+            sWinStart = pbNow;
+            sWinPresents0 = pbPresents;
+            sWinHolds0 = pbHolds;
+            sWinSubSkip0 = pbSubSkip;
+            sBadWindows = 0;
+            sUpCreditMs = 0.0;
+        };
+
+        if (sFirstCall) {
+            sFirstCall = false;
+            sQuietUntil = pbNow + pbQuiet;
+            sNextUpCheck = pbNow + pbRetry;
+            gPbStepReason = "startup";
+            pbArmWindow();
+        }
+
+        if (PBIos_IsBackgrounded() != 0) {
+            sWasBackgrounded = true;
+        } else if (sWasBackgrounded) {
+            // A resume arrives with a stall of its own; it is not evidence.
+            sWasBackgrounded = false;
+            sQuietUntil = pbNow + pbQuiet;
+            gPbStepReason = "resume";
+            pbArmWindow();
+        }
+
+        if (pbFps != sBase || pbSsaa != sSsaa || pbMaxFps != sMaxFps) {
+            if (sSteps > 0) {
+                SPDLOG_INFO("[PaperBoat-iOS] interpolation step reset (target {} -> {}, ssaa {:.2f} -> {:.2f}, "
+                            "maxfps {} -> {}); {:.0f} s quiet, then a fresh {:.0f} s window",
+                            sBase, pbFps, sSsaa, pbSsaa, sMaxFps, pbMaxFps, kPbQuietS, kPbWindowMs / 1000.0);
+            }
+            sBase = pbFps;
+            sSsaa = pbSsaa;
+            sMaxFps = pbMaxFps;
+            sSteps = 0;
+            sStepUps = 0;
+            sRetryS = 10.0;
+            sHaveStepUp = false;
+            sQuietUntil = pbNow + pbQuiet;
+
+            sNextUpCheck = pbNow + std::chrono::milliseconds((long long)(sRetryS * 1000.0));
+            gPbStepReason = "reset";
+            pbArmWindow();
+        }
+
+        uint32_t pbStepped = pbFps;
+        for (int i = 0; i < sSteps && pbStepped > 30; i++) {
+            pbStepped /= 2;
+        }
+        if (pbStepped < 30) {
+            pbStepped = 30;
+        }
+        uint32_t pbHigher = pbStepped * 2;
+        if (pbHigher > pbFps) {
+            pbHigher = pbFps;
+        }
+
+        bool pbStepDownNow = false;
+        bool pbStepUpNow = false;
+        double pbWinGpuP95 = 0.0;
+
+        if (pbNow - sWinStart >= std::chrono::milliseconds((long long)kPbWindowMs)) {
+            const int pbWinPresents = pbPresents - sWinPresents0;
+            const bool pbHeld = pbHolds != sWinHolds0;
+            const bool pbSkipRising = pbSubSkip > sWinSubSkip0;
+            // Enough of a window to say anything at all.
+            const bool pbEnough = pbNow >= sQuietUntil && pbWinPresents >= kPbMinPresents && pbTps > 0.0;
+
+            // A CLEAN WINDOW is one with no held frame (PM64 holds frames
+            // across map transitions) and no present or loop period past
+            // 250 ms, and both votes are counted over clean windows only. What
+            // differs is what a DISCARDED window does: it clears the down-vote
+            // streak - a 6 s verdict has to be 6 s of comparable play - but
+            // leaves the step-up's credit untouched (see below).
+            const bool pbDownOk = pbEnough && !pbHeld && pbPresentMax <= kPbSpikeMs && pbLoopMax <= kPbSpikeMs;
+
+            if (pbDownOk && pbTps < kPbTpsDown && pbSkipRising) {
+                sBadWindows++;
+            } else {
+                // A clean-but-healthy window, or a window that says nothing:
+                // either way no streak survives it. A 6 s verdict has to be 6 s
+                // of comparable play - rev 4 had no notion of an invalid window
+                // at all, which is how one 21 s stall cost 120 Hz on 0.0.0.14.
+                sBadWindows = 0;
+                if (!pbDownOk && pbEnough) {
+                    gPbStepReason = pbHeld ? "window_held" : "window_spike";
+                }
+            }
+
+            // THE STEP-UP ACCUMULATES CREDIT, IT DOES NOT RUN A TIMER. Only a
+            // clean window (the same cleanliness the down-vote demands) votes:
+            // one that meets the condition adds its own length to the credit,
+            // one that is clean and does NOT meet it wipes the credit, and a
+            // window discarded as a load does neither. A continuous 10 s timer
+            // was tried first and could not survive the attract demo, where a
+            // scene change every 10-20 s reset it at `upok_s=9` twice in a row
+            // (M-032 §3) - the same shape of bug as rev 3's permanent latch,
+            // just slower. Credit is what makes 10 s of evidence mean 10 s of
+            // evidence rather than 10 s of luck.
+            pbWinGpuP95 = PBIos_PerfGpuGameP95();
+            const bool pbUpPass = sSteps > 0 && pbHigher > pbStepped && pbTps >= kPbTpsUp &&
+                                  pbWinGpuP95 > 0.0 && pbWinGpuP95 < kPbUpFactor * (1000.0 / (double)pbHigher);
+            if (pbDownOk) {
+                if (pbUpPass) {
+                    sUpCreditMs += kPbWindowMs;
+                } else {
+                    sUpCreditMs = 0.0;
+                }
+            }
+
+            if (sBadWindows >= 2 && pbStepped > 30) {
+                pbStepDownNow = true;
+            } else if (sUpCreditMs >= kPbUpHoldS * 1000.0 && pbNow >= sNextUpCheck) {
+                pbStepUpNow = true;
+            }
+            // Publish what the window that just closed actually measured.
+            gPbWinTps = pbTps;
+            gPbWinPresents = pbWinPresents;
+            gPbWinMaxPresentMs = pbPresentMax;
+            gPbWinMaxLoopMs = pbLoopMax;
+            gPbWinHeld = pbHeld ? 1 : 0;
+
+            // The window that just closed is where the next one starts.
+            sWinStart = pbNow;
+            sWinPresents0 = pbPresents;
+            sWinHolds0 = pbHolds;
+            sWinSubSkip0 = pbSubSkip;
+        }
+
+        if (pbStepDownNow) {
+            if (sHaveStepUp && pbNow - sLastStepUp < std::chrono::seconds(30)) {
+                sRetryS = sRetryS * 2.0 > 120.0 ? 120.0 : sRetryS * 2.0;
+            }
+            sSteps++;
+            const uint32_t pbNext = pbStepped > 60 ? pbStepped / 2 : 30;
+            SPDLOG_WARN("[PaperBoat-iOS] the game is running slow and the sub-frame skip cannot keep up: tps "
+                        "{:.2f}/30 with skips rising, over two {:.0f} s windows with no hold and no period past "
+                        "{:.0f} ms - stepping the interpolation target down {} -> {} (one 30 Hz tick is expanded "
+                        "into target/30 presented sub-frames, so a target the machine cannot reach is slow "
+                        "gameplay); next step-up check in {:.0f} s",
+                        pbTps, kPbWindowMs / 1000.0, kPbSpikeMs, pbStepped, pbNext, sRetryS);
+            gPbStepReason = "tps_slow";
+            sQuietUntil = pbNow + pbQuiet;
+            sNextUpCheck = pbNow + std::chrono::milliseconds((long long)(sRetryS * 1000.0));
+            pbArmWindow();
+            pbStepped = pbNext;
+        } else if (pbStepUpNow) {
+            sSteps--;
+            sStepUps++;
+            sHaveStepUp = true;
+            sLastStepUp = pbNow;
+            SPDLOG_INFO("[PaperBoat-iOS] the game is at full speed (tps {:.2f}/30) and its GPU price "
+                        "(gpu_game_ms p95 {:.2f} ms) has fitted {} Hz (budget {:.2f} ms) for {:.0f} s - stepping "
+                        "the interpolation target back UP {} -> {}",
+                        pbTps, pbWinGpuP95, pbHigher, kPbUpFactor * (1000.0 / (double)pbHigher), kPbUpHoldS,
+                        pbStepped, pbHigher);
+            gPbStepReason = "gpu_and_tps_fit";
+            sQuietUntil = pbNow + pbQuiet;
+            sNextUpCheck = pbNow + std::chrono::milliseconds((long long)(sRetryS * 1000.0));
+            pbArmWindow();
+            pbStepped = pbHigher;
+        }
+
+        pbFps = pbStepped;
+        gPbRefreshHz = (int)pbRefresh;
+        gPbInterpTarget = (int)pbFps;
+        gPbStepDown = sSteps;
+        gPbStepUps = sStepUps;
+        gPbRetryS = sRetryS;
+        gPbBadWindows = sBadWindows;
+        gPbUpOkS = (int)(sUpCreditMs / 1000.0);
+    }
+#endif
+
+    return pbFps;
+}
+"""
+text = replace_once(text, OLD, NEW, "GetInterpolationFPS")
+
+with tempfile.NamedTemporaryFile("w", suffix=".a", delete=False) as fa, \
+     tempfile.NamedTemporaryFile("w", suffix=".b", delete=False) as fb:
+    fa.write(orig); fb.write(text); fa.flush(); fb.flush()
+    r = subprocess.run(["diff", "-u", "--label", f"a/{REL}", "--label", f"b/{REL}",
+                        fa.name, fb.name], capture_output=True)
+assert r.returncode == 1, "diff produced no change"
+
+OUT.write_text(__doc__ + "\n" + r.stdout.decode())
+print(f"wrote {OUT}")

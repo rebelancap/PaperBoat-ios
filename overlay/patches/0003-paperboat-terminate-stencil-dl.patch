@@ -1,0 +1,62 @@
+Overlay patch 0003 — terminate D_8014EA48, the unterminated stencil display list.
+
+CLASS: (b) upstream bug fix worth sending.
+
+`src/screen_overlays.c`'s `Gfx D_8014EA48[]` ends with
+
+    gsSP2Triangles(20, 22, 21, 0, 23, 21, 22, 0),
+    gsDPPipeSync(),
+    gsDPSetDepthSource(G_ZS_PIXEL)
+};
+
+with NO `gsSPEndDisplayList()`. It is entered with a PUSHING
+`gSPDisplayList(gMainGfxPos++, D_8014EA48)` (line 317), so both consumers walk
+off the end of the array into whatever static data the linker put next:
+
+1. `port_patch_dl(D_8014EA48)` — `gbi_resolve_vtx_in_static_dl()`
+   (src/port/GBIMiddleware.cpp) loops `for (Gfx* cmd = dl;; cmd++)` and breaks
+   ONLY on `G_ENDDL`. Past the end it eventually reads a word whose top byte
+   looks like `G_VTX`/`G_DL`, takes `words.w1` as a pointer and hands it to
+   `GameEngine_OTRSigCheck()`, whose `< 0x10000` guard does not catch a large
+   garbage value. `strncmp` then faults.
+2. the Fast3D interpreter at render time, for the same reason.
+
+On the iPhone Air simulator (iOS 27) this kills the app on its FIRST frame —
+`_render_transition_stencil()` runs the one-shot `port_patch_dl` block before
+the `progress == 0.0f` early-out, and `main_loop.c:289` calls it every boot:
+
+    EXC_BAD_ACCESS (SIGSEGV) KERN_INVALID_ADDRESS at 0x000001ff01e00280
+    0 libsystem_platform.dylib  _platform_strncmp
+    1 Paperboat                 GameEngine_OTRSigCheck
+    2 Paperboat                 gbi_resolve_vtx_in_static_dl
+    3 Paperboat                 _render_transition_stencil
+    4 Paperboat                 gfx_draw_frame
+
+The faulting address is identical across runs — it is a constant read out of
+static data, not a wild heap pointer, which is what pins this on data layout
+rather than on chance. The macOS oracle survives the same code for exactly that
+reason: a different link order happens to put a G_ENDDL-shaped word close
+enough behind the array. It is undefined behaviour on both.
+
+The fix is the missing terminator, and nothing else. There is no fall-through
+to preserve: the next thing in the translation unit is a function, not another
+Gfx array, so the overrun has never had a defined destination.
+
+--- a/src/screen_overlays.c
++++ b/src/screen_overlays.c
+@@ -159,7 +159,14 @@
+     gsDPLoadTextureTile(&D_80156910, G_IM_FMT_RGBA, G_IM_SIZ_16b, 160, 0, 0, 110, 159, 119, 0, G_TX_NOMIRROR | G_TX_CLAMP, G_TX_NOMIRROR | G_TX_CLAMP, 8, 4, G_TX_NOLOD, G_TX_NOLOD),
+     gsSP2Triangles(20, 22, 21, 0, 23, 21, 22, 0),
+     gsDPPipeSync(),
+-    gsDPSetDepthSource(G_ZS_PIXEL)
++    gsDPSetDepthSource(G_ZS_PIXEL),
++    // PAPERBOAT_IOS: this terminator was missing. D_8014EA48 is entered with a
++    // pushing gSPDisplayList (below), so without a G_ENDDL both the Fast3D
++    // interpreter and port_patch_dl()'s gbi_resolve_vtx_in_static_dl() walk off
++    // the end of the array into unrelated static data. On iOS that faults on
++    // the first frame, inside GameEngine_OTRSigCheck, on a garbage pointer read
++    // out of a word past the array.
++    gsSPEndDisplayList()
+ };
+ 
+ // Runtime, widescreen-aware equivalent of D_8014E9A8: the full-screen overlay

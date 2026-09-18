@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Overlay patch 0006 — compile the shell's C++ side, and the console-bridge toggle.
+
+CLASS: (a) program-baseline parity.
+
+The program's remote console bridge (spec D3: PaperBoat listens on :8771)
+lives in `app/ios/PaperBoatIosShell.m`, in THIS repo — sockets, gating, protocol
+and all. But it has to reach libultraship's command interpreter
+(`Ship::Console::Run`, whose signature is std::string/std::vector) and LUS's
+settings writer (`ConsoleVariable::Save()`), and the shell is Objective-C, not
+Objective-C++.
+
+So the shell grew a second file, `app/ios/PaperBoatIosConsole.cpp`, which is the
+ONLY part of the port's shell that speaks libultraship and which exports a C ABI
+(`PBIos_EngineReady`, `PBIos_ConsoleRun`, `PBIos_ConfigSave`). The alternative —
+renaming the shell to `.mm` — would recompile every line of UIKit code in it as
+Objective-C++ to gain three calls, and would drag every LUS header (and ImGui
+behind them) into the same translation unit as the UIWindow swizzle.
+
+This patch is the vendor half of that: compile the new file into the iOS target,
+and add the compile-time switch that takes the bridge OUT.
+
+    PAPERBOAT_REMOTE_CONSOLE  ON by default, and `scripts/build-release.sh` will
+                              pass OFF.
+
+Why a compile-time switch and not only a runtime gate: the bridge is an
+UNAUTHENTICATED command server (it can set any CVar and read files out of the
+container) and a `paperboat://console` link can ask a RUNNING app to start it.
+A public build must not merely decline to listen — it must not contain a
+listener at all. The runtime gate (`PAPERBOAT_CONSOLE` in the environment, a
+`console_enabled` file in Documents, or the deep link) is the second lock, for
+dev builds.
+
+Class (a) rather than (b): upstream has no socket code anywhere
+(`socket(`/`SO_REUSEADDR` are absent from `src/` and from its LUS fork), and a
+debug listener is a port decision, not an upstream bug. The CMake hunk is
+written to be harmless upstream all the same — both new variables have defaults
+and the file list is guarded by an `EXISTS` assertion, so a plain
+`cmake -B build` without `-DPAPERBOAT_IOS_SHELL_DIR` fails with the same clear
+message it already did.
+"""
+import subprocess, pathlib, tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VENDOR = ROOT / "vendor/PaperBoat"
+REL = "CMakeLists.txt"
+OUT = ROOT / "overlay/patches/0006-paperboat-ios-console-bridge-build.patch"
+
+src = VENDOR / REL
+orig = src.read_text()
+
+# The insertion point is deliberately NOT inside the block overlay 0001 added.
+# scripts/apply-overlay.sh probes every patch for "already applied" by
+# REVERSE-applying it at --fuzz=0, so two patches that touch the same three
+# lines of context make the series non-idempotent: the second build fails with
+# "0001 neither applied nor appliable". (Measured the hard way this round.)
+# This patch therefore appends its own block after set_target_properties(),
+# four lines clear of 0001's trailing context.
+OLD = """        RESOURCE "${IMAGE_FILES};${STORYBOARD_FILE};${ICON_FILES}"
+        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${BUNDLE_ID}"
+    )
+"""
+
+NEW = """        RESOURCE "${IMAGE_FILES};${STORYBOARD_FILE};${ICON_FILES}"
+        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${BUNDLE_ID}"
+    )
+
+    # PAPERBOAT_IOS (overlay 0006): the C++ side of the app shell.
+    #
+    # PaperBoatIosShell.m (overlay 0001) is Objective-C and stays that way; the
+    # remote console bridge in it needs libultraship's C++ command interpreter
+    # (Ship::Console::Run) and settings writer (ConsoleVariable::Save), so those
+    # two calls live in PaperBoatIosConsole.cpp behind a C ABI. Renaming the
+    # shell to .mm instead would recompile every line of its UIKit code as
+    # Objective-C++ and drag every LUS header in beside the UIWindow swizzle.
+    if(NOT EXISTS "${PAPERBOAT_IOS_SHELL_DIR}/PaperBoatIosConsole.cpp")
+        message(FATAL_ERROR "iOS build requires -DPAPERBOAT_IOS_SHELL_DIR=<dir containing PaperBoatIosConsole.cpp>")
+    endif()
+    target_sources(${PROJECT_NAME} PRIVATE "${PAPERBOAT_IOS_SHELL_DIR}/PaperBoatIosConsole.cpp")
+
+    # The bridge (:8771) is an UNAUTHENTICATED command server: it sets CVars and
+    # reads files out of the container, and a paperboat://console link can ask a
+    # RUNNING app to start it. A public build must not merely decline to listen
+    # — it must contain no listener at all, so the whole thing is compiled out
+    # unless this is ON. Dev and simulator builds keep it ON;
+    # scripts/build-release.sh passes OFF.
+    set(PAPERBOAT_REMOTE_CONSOLE ON CACHE BOOL "Compile in the TCP console bridge on :8771")
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        PAPERBOAT_REMOTE_CONSOLE=$<BOOL:${PAPERBOAT_REMOTE_CONSOLE}>)
+"""
+
+n = orig.count(OLD)
+assert n == 1, f"{REL}: expected 1 match of the iOS set_target_properties tail, got {n}"
+text = orig.replace(OLD, NEW)
+
+with tempfile.NamedTemporaryFile("w", suffix=".a", delete=False) as fa, \
+     tempfile.NamedTemporaryFile("w", suffix=".b", delete=False) as fb:
+    fa.write(orig); fb.write(text); fa.flush(); fb.flush()
+    r = subprocess.run(["diff", "-u", "--label", f"a/{REL}", "--label", f"b/{REL}",
+                        fa.name, fb.name], capture_output=True)
+assert r.returncode == 1, "diff produced no change"
+
+OUT.write_text(__doc__ + "\n" + r.stdout.decode())
+print(f"wrote {OUT}")

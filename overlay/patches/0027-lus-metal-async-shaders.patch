@@ -1,0 +1,462 @@
+Overlay patch 0027 - async Metal shader compilation.
+
+CLASS: (a) program-baseline parity.
+
+This is `docs/lus-divergence.md` row 0035, the last unported item of the
+SoH port's LUS perf set that can stall the game thread for longer than the audio
+reservoir holds. The SoH port's patch (`Shipwright-ios/overlay/patches/
+0035-lus-metal-async-shaders.patch`, its D-034) came from 2ship's device-validated
+finding (`FINDINGS-FROM-2SHIP-async-shader-stutter.md`): a cold `newLibrary` is
+**120-160 ms per shader** on A-series silicon, `newRenderPipelineState` another
+~25 %, and this fork does both **synchronously, inside the draw path**
+(`GfxRenderingAPIMetal::CreateAndLoadNewShader`, called from the interpreter the
+first time a colour-combiner/geometry-mode pair is seen).
+
+WHY IT IS IN THIS ROUND
+-----------------------
+Round 13 is the ~5 s audio/video stutter (the design notes D26). `docs/frame-map.md`:
+the game thread wakes the audio thread once per frame and then blocks on it, and
+the reservoir is 52.5 ms (90 ms after overlay 0026). ANY game-thread stall past
+that is heard as a click and seen as a freeze, together. A 150 ms synchronous
+shader compile is three times the old budget in one call.
+
+The simulator's attract demo does NOT reproduce this half - overlay 0012 rev2's
+`lib_n`/`pso_n` read 0 across every sampled window (the measurement log M-025), because
+the demo revisits scenes whose shaders are already in the pool. The user's device
+session was real play, moving through new rooms, which is exactly when a new
+combiner pair appears - and the device log's median gap between underrun
+clusters (4.06 s) is the shape of "a new shader every few seconds while
+exploring". So this patch ships on the strength of the SoH port's device
+validation and the mechanism, and is labelled honestly in MEASUREMENTS as
+*not* measured on the simulator; `lib_ms`/`pso_ms` are in the `fps` line so the
+device round can settle it in one reading.
+
+HOW - REV 2, THE JOB OWNS ITS OUTPUTS
+-------------------------------------
+Register the program shell and everything the draw path reads SYNCHRONOUSLY -
+the interpreter binds the returned pointer immediately - and move only
+`newLibrary` + `newRenderPipelineState` onto a detached worker.
+
+Rev 1 handed the worker a raw `ShaderProgramMetal*` into `mShaderProgramPool`
+and let it write `pipeline_state_variants[...]` directly. **That was a
+use-after-free**, reachable in ordinary play: `Interpreter::SetShaderSettingValue`
+(interpreter.cpp:5357, every shader-setting CVar) calls `gfx_shader_cache_clear()`
+-> `ClearShaderCache()`, which marks EVERY pool entry `markedForDeletion`, and
+the next `LookupShader()` for that key **erases** the entry - while the worker
+still holds the pointer. Rev 1's header note argued no marked program could be
+in flight; that is simply false once a cache clear can arrive from the menu
+mid-compile. Round 14's review caught it before any device build shipped.
+
+Rev 2 makes the compile job an owner, not a borrower:
+
+* `PBIosShaderCompileJob` (gfx_metal.cpp, `Fast` namespace) is a
+  `std::shared_ptr` struct holding *everything* the worker needs (a RETAINED
+  `MTL::Device*`, a retained `MTL::VertexDescriptor*`, the MSL source, the
+  alpha flag, the enabled MSAA levels) and *everything* it produces (its own
+  `variants[]` array) plus an `std::atomic<int> state`
+  (pending / ready / failed).
+* **The worker never touches the pool entry** - no `this`, no `prg`, no
+  `mDevice`, no `mMsaaNumQualityLevels`. It fills `job->variants[]` and then
+  publishes with ONE release store of `state`.
+* **The render thread delivers.** `PBIosClaimShaderJob(prg)` runs in
+  `LookupShader` and in `DrawTriangles` (the only two places that look at a
+  program's pipelines): it acquire-loads `state`, and on `ready` MOVES each
+  pointer out of the job into `prg->pipeline_state_variants[...]`, then drops
+  the entry's reference. Release/acquire, properly paired - rev 1 had a bare
+  `atomic_thread_fence(release)` on the writer and nothing at all on the reader.
+* **Erase is now safe.** The entry holds only a `shared_ptr`; erasing it (or
+  overwriting it with a newer job for the same key) drops one reference. The
+  worker's own copy keeps the job alive, it finishes into its own struct, and
+  the last reference to die releases the device, the vertex descriptor and any
+  pipeline states nobody claimed. `ClearShaderCache` needs no change and no
+  caveat.
+* The partial-failure path (library compiled, `newFunction` returned null)
+  releases BOTH functions, not neither, and marks the job failed so the entry
+  stops waiting for it.
+
+The synchronous path (`gSohIos.AsyncShaders 0`) runs the very same job function
+inline and claims it immediately, so there is one code path to reason about and
+the variants are non-null by the time `CreateAndLoadNewShader` returns.
+
+The draw path still has to tolerate a null pipeline for a few frames:
+`DrawTriangles` returns early WITHOUT advancing `mLastShaderProgram` (so the
+bind is retried next draw) and WITHOUT advancing `mCurrentVertexBufferOffset`
+(the slot is reused). The geometry pops in a frame or two later instead of the
+whole frame stalling.
+
+`gSohIos.AsyncShaders`, default **ON**, live kill switch over the console bridge
+(`set gSohIos.AsyncShaders 0`) and a checkbox in Settings > iOS > Advanced
+(overlay 0021). __IOS__-only: the macOS oracle keeps the pristine synchronous
+path, which is what makes it an oracle.
+
+WHERE THIS FORK DIVERGES FROM THE SOH PORT'S 0035
+--------------------------------------------------
+Recorded because the upstream-bump drill needs it:
+
+1. **No `mSrgbMode`.** This fork hardwires `MTL::PixelFormatBGRA8Unorm` for the
+   colour attachment; the SoH port's LUS picks `_sRGB` from a member. One less
+   captured variable.
+2. **More program fields.** This fork's `ShaderProgramMetal` carries
+   `usedTextures[2..5]` (masks and blend), `usedTextures[SHADER_PALETTE_TEXTURE]`
+   and `usedLighting`, which the SoH port's does not. All are set synchronously
+   here, because `DrawTriangles` reads them before it ever looks at the pipeline.
+3. **`LookupShader` can erase - and this patch survives it.** The SoH port's
+   0035 (and this patch's rev 1) hand the worker a raw pool pointer and argue
+   the erase cannot race; see above, it can. The ownership model here is the
+   fix, and it is the one worth sending upstream and back to the siblings.
+   It costs one `shared_ptr` per `ShaderProgramMetal` (the only header change).
+4. **The error path returns nullptr upstream.** Upstream bails out of
+   `CreateAndLoadNewShader` when `newLibrary` fails. Asynchronously there is
+   nobody to return to, so a failed library logs, marks the job failed and
+   leaves the variants null - which the draw guard already handles as "not
+   ready", i.e. that shader's geometry never draws instead of crashing on a
+   null pipeline state. That is strictly better than upstream's synchronous
+   path, which returns nullptr to an interpreter that dereferences it (overlay
+   0002's original crash).
+
+UPSTREAMABLE: yes, as an iOS/mobile option - it is the same patch three siblings
+already carry, plus the ownership fix they all still need.
+
+--- a/external/libultraship/include/fast/backends/gfx_metal.h
++++ b/external/libultraship/include/fast/backends/gfx_metal.h
+@@ -12,6 +12,11 @@
+ 
+ #include <imgui_impl_sdl2.h>
+ #include <simd/simd.h>
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0027): ShaderProgramMetal holds a shared_ptr to its
++// in-flight async shader compile.
++#include <memory>
++#endif
+ 
+ static constexpr size_t kMaxVertexBufferPoolSize = 3;
+ static constexpr size_t kVertexBufferBaseSize = 256 * 32 * 3 * sizeof(float) * 50;
+@@ -57,6 +62,13 @@
+ };
+ 
+ namespace Fast {
++
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0027): the async shader compile job, defined in
++// gfx_metal.cpp. It owns its own inputs and outputs, so a pool entry can be
++// erased (ClearShaderCache + LookupShader) while a compile is still running.
++struct PBIosShaderCompileJob;
++#endif
+ 
+ struct ShaderProgramMetal {
+     uint64_t shader_id0;
+@@ -71,6 +83,14 @@
+ 
+     // hashed by msaa_level
+     MTL::RenderPipelineState* pipeline_state_variants[9];
++
++#ifdef __IOS__
++    // PAPERBOAT_IOS (overlay 0027): the compile that will fill
++    // pipeline_state_variants, or null once it has been claimed. Holding it by
++    // shared_ptr is what makes erasing this entry mid-compile safe: the worker
++    // owns a reference too and writes only into the job.
++    std::shared_ptr<PBIosShaderCompileJob> pbIosJob;
++#endif
+ };
+ 
+ struct TextureDataMetal {
+--- a/external/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/external/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -207,8 +207,174 @@
+ 
+ void GfxRenderingAPIMetal::LoadShader(struct ShaderProgram* new_prg) {
+     mShaderProgram = (struct ShaderProgramMetal*)new_prg;
++}
++
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0027): async Metal shader compilation.
++//
++// <atomic> and <chrono> come in with overlay 0012's ledger block near the top of
++// this file, and the ledgers themselves (gPBIosShaderLibUs / ...N / ...PsoUs /
++// ...PsoN) are declared there too - this patch only writes them.
++#include <thread>
++#include <memory>
++
++// One compile job. It OWNS everything the worker reads and everything the
++// worker produces, so the worker never dereferences the pool entry that
++// requested it - `ClearShaderCache()` (reachable from the menu at any moment
++// via Interpreter::SetShaderSettingValue -> gfx_shader_cache_clear) marks every
++// entry for deletion and the next LookupShader erases it.
++struct PBIosShaderCompileJob {
++    enum PBIosJobState { kPBIosJobPending = 0, kPBIosJobReady = 1, kPBIosJobFailed = 2 };
++
++    // The worker's release store; the render thread's acquire load. Everything
++    // written into variants[] below happens-before a kPBIosJobReady is observed.
++    std::atomic<int> state{ kPBIosJobPending };
++
++    // Inputs, owned (retained) by the job.
++    MTL::Device* device = nullptr;
++    MTL::VertexDescriptor* vertexDescriptor = nullptr;
++    std::string source;
++    bool optAlpha = false;
++    bool msaaLevelEnabled[METAL_MAX_MULTISAMPLE_SAMPLE_COUNT] = {};
++
++    // Outputs, owned by the job until the render thread moves them into the
++    // pool entry. Whatever is still here when the last reference dies belonged
++    // to an entry that was erased mid-compile, and is released.
++    MTL::RenderPipelineState* variants[ARRAY_COUNT(ShaderProgramMetal::pipeline_state_variants)] = {};
++
++    ~PBIosShaderCompileJob() {
++        for (int i = 0; i < ARRAY_COUNT(variants); i++) {
++            if (variants[i] != nullptr) {
++                variants[i]->release();
++            }
++        }
++        if (vertexDescriptor != nullptr) {
++            vertexDescriptor->release();
++        }
++        if (device != nullptr) {
++            device->release();
++        }
++    }
++};
++
++// The worker body. Runs on a detached thread (async) or inline (kill switch).
++// It touches nothing but the job it was handed.
++static void PBIosRunShaderCompile(std::shared_ptr<PBIosShaderCompileJob> job) {
++    NS::AutoreleasePool* pbPool = NS::AutoreleasePool::alloc()->init();
++    NS::Error* pbError = nullptr;
++
++    const auto pbLibT0 = std::chrono::steady_clock::now();
++    MTL::Library* pbLibrary =
++        job->device->newLibrary(NS::String::string(job->source.c_str(), NS::UTF8StringEncoding), nullptr, &pbError);
++    gPBIosShaderLibUs.fetch_add(
++        (uint64_t)std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - pbLibT0).count());
++    gPBIosShaderLibN.fetch_add(1);
++
++    if (pbLibrary == nullptr) {
++        // Nobody to return nullptr to out here. The draw guard treats a null
++        // pipeline as "not ready", so this shader's geometry simply never draws
++        // - which beats handing the interpreter a null program pointer the way
++        // the synchronous path does.
++        SPDLOG_ERROR("Failed to compile shader library, error {}",
++                     pbError ? pbError->localizedDescription()->cString(NS::UTF8StringEncoding)
++                             : "(null library, no error)");
++        job->state.store(PBIosShaderCompileJob::kPBIosJobFailed, std::memory_order_release);
++        pbPool->release();
++        return;
++    }
++
++    MTL::Function* pbVertexFunc = pbLibrary->newFunction(NS::String::string("vertexShader", NS::UTF8StringEncoding));
++    MTL::Function* pbFragmentFunc = pbLibrary->newFunction(NS::String::string("fragmentShader", NS::UTF8StringEncoding));
++    if (pbVertexFunc == nullptr || pbFragmentFunc == nullptr) {
++        SPDLOG_ERROR("Failed to find shader functions in compiled library (vertexShader={}, fragmentShader={})",
++                     pbVertexFunc != nullptr, pbFragmentFunc != nullptr);
++        if (pbVertexFunc != nullptr) {
++            pbVertexFunc->release();
++        }
++        if (pbFragmentFunc != nullptr) {
++            pbFragmentFunc->release();
++        }
++        pbLibrary->release();
++        job->state.store(PBIosShaderCompileJob::kPBIosJobFailed, std::memory_order_release);
++        pbPool->release();
++        return;
++    }
++
++    MTL::RenderPipelineDescriptor* pbDesc = MTL::RenderPipelineDescriptor::alloc()->init();
++    pbDesc->setVertexFunction(pbVertexFunc);
++    pbDesc->setFragmentFunction(pbFragmentFunc);
++    pbDesc->setVertexDescriptor(job->vertexDescriptor);
++    pbDesc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
++    pbDesc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
++    if (job->optAlpha) {
++        pbDesc->colorAttachments()->object(0)->setBlendingEnabled(true);
++        pbDesc->colorAttachments()->object(0)->setSourceRGBBlendFactor(MTL::BlendFactorSourceAlpha);
++        pbDesc->colorAttachments()->object(0)->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
++        pbDesc->colorAttachments()->object(0)->setRgbBlendOperation(MTL::BlendOperationAdd);
++        pbDesc->colorAttachments()->object(0)->setSourceAlphaBlendFactor(MTL::BlendFactorZero);
++        pbDesc->colorAttachments()->object(0)->setDestinationAlphaBlendFactor(MTL::BlendFactorOne);
++        pbDesc->colorAttachments()->object(0)->setAlphaBlendOperation(MTL::BlendOperationAdd);
++        pbDesc->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
++    } else {
++        pbDesc->colorAttachments()->object(0)->setBlendingEnabled(false);
++        pbDesc->colorAttachments()->object(0)->setWriteMask(MTL::ColorWriteMaskAll);
++    }
++
++    for (int i = 0; i < ARRAY_COUNT(job->msaaLevelEnabled); i++) {
++        if (!job->msaaLevelEnabled[i]) {
++            continue;
++        }
++        const int pbMsaaLevel = i + 1;
++        if (pbMsaaLevel >= ARRAY_COUNT(job->variants)) {
++            continue;
++        }
++        pbDesc->setSampleCount(pbMsaaLevel);
++        const auto pbPsoT0 = std::chrono::steady_clock::now();
++        MTL::RenderPipelineState* pbState = job->device->newRenderPipelineState(pbDesc, &pbError);
++        gPBIosShaderPsoUs.fetch_add(
++            (uint64_t)std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - pbPsoT0).count());
++        gPBIosShaderPsoN.fetch_add(1);
++        if (pbState == nullptr) {
++            SPDLOG_ERROR("Failed to create pipeline state, error {}",
++                         pbError ? pbError->localizedDescription()->cString(NS::UTF8StringEncoding)
++                                 : "(null state, no error)");
++        }
++        job->variants[pbMsaaLevel] = pbState;
++    }
++
++    pbVertexFunc->release();
++    pbFragmentFunc->release();
++    pbLibrary->release();
++    pbDesc->release();
++
++    // Publish LAST. This release store is the only thing the render thread
++    // synchronises on, so every write to variants[] above is ordered before it.
++    job->state.store(PBIosShaderCompileJob::kPBIosJobReady, std::memory_order_release);
++    pbPool->release();
+ }
+ 
++// Render thread ONLY (LookupShader / DrawTriangles). Moves a finished job's
++// pipeline states into the pool entry and drops the entry's reference. Until
++// this runs, prg->pipeline_state_variants stays null and the draw guard skips.
++static void PBIosClaimShaderJob(struct ShaderProgramMetal* prg) {
++    if (prg == nullptr || !prg->pbIosJob) {
++        return;
++    }
++    const int pbState = prg->pbIosJob->state.load(std::memory_order_acquire);
++    if (pbState == PBIosShaderCompileJob::kPBIosJobPending) {
++        return;
++    }
++    if (pbState == PBIosShaderCompileJob::kPBIosJobReady) {
++        for (int i = 0; i < ARRAY_COUNT(prg->pipeline_state_variants); i++) {
++            prg->pipeline_state_variants[i] = prg->pbIosJob->variants[i];
++            // Ownership moves to the entry; the job must not release it.
++            prg->pbIosJob->variants[i] = nullptr;
++        }
++    }
++    prg->pbIosJob.reset();
++}
++#endif
++
+ void GfxRenderingAPIMetal::ClearShaderCache() {
+     for (auto& [key, prg] : mShaderProgramPool) {
+         prg.markedForDeletion = true;
+@@ -226,6 +392,66 @@
+     MTL::VertexDescriptor* vertex_descriptor =
+         gfx_metal_build_shader(buf, numFloats, cc_features, mCurrentFilterMode == FILTER_THREE_POINT);
+ 
++#ifdef __IOS__
++    // PAPERBOAT_IOS (overlay 0027): async Metal shader compilation.
++    //
++    // Everything DrawTriangles reads is filled in synchronously below, because
++    // the interpreter binds the returned program on the very next call. Only
++    // newLibrary + newRenderPipelineState - 120-160 ms cold on A-series - go to
++    // a worker, and they go there inside a job that owns its own inputs and
++    // outputs (see PBIosShaderCompileJob above): this entry may be erased
++    // before the compile finishes.
++    {
++        struct ShaderProgramMetal* prg = &mShaderProgramPool[std::make_pair(shader_id0, shader_id1)];
++        prg->shader_id0 = shader_id0;
++        prg->shader_id1 = shader_id1;
++        prg->usedTextures[0] = cc_features.usedTextures[0];
++        prg->usedTextures[1] = cc_features.usedTextures[1];
++        prg->usedTextures[2] = cc_features.used_masks[0];
++        prg->usedTextures[3] = cc_features.used_masks[1];
++        prg->usedTextures[4] = cc_features.used_blend[0];
++        prg->usedTextures[5] = cc_features.used_blend[1];
++        prg->usedTextures[SHADER_PALETTE_TEXTURE] = cc_features.used_palette[0] || cc_features.used_palette[1];
++        prg->numInputs = cc_features.numInputs;
++        prg->numFloats = numFloats;
++        prg->usedLighting = cc_features.opt_lighting || cc_features.opt_texgen;
++        for (int pbV = 0; pbV < ARRAY_COUNT(prg->pipeline_state_variants); pbV++) {
++            prg->pipeline_state_variants[pbV] = nullptr;
++        }
++        LoadShader((struct ShaderProgram*)prg);
++
++        auto pbJob = std::make_shared<PBIosShaderCompileJob>();
++        // The job outlives this call and may outlive the pool entry, so it
++        // retains what it reads instead of borrowing it: the device, and the
++        // vertex descriptor gfx_metal_build_shader autoreleased.
++        mDevice->retain();
++        pbJob->device = mDevice;
++        vertex_descriptor->retain();
++        pbJob->vertexDescriptor = vertex_descriptor;
++        pbJob->source = buf;
++        pbJob->optAlpha = cc_features.opt_alpha;
++        for (int pbM = 0; pbM < ARRAY_COUNT(mMsaaNumQualityLevels); pbM++) {
++            pbJob->msaaLevelEnabled[pbM] = (mMsaaNumQualityLevels[pbM] == 1);
++        }
++        // Assignment drops any earlier job for this key (a cache clear followed
++        // by a re-create): that worker keeps its own reference, finishes into
++        // its own struct and discards the result.
++        prg->pbIosJob = pbJob;
++
++        const bool pbAsync =
++            Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger("gSohIos.AsyncShaders", 1) != 0;
++        if (pbAsync) {
++            std::thread(PBIosRunShaderCompile, pbJob).detach();
++        } else {
++            PBIosRunShaderCompile(pbJob);
++            // Same code path as the async claim, one frame earlier: the
++            // variants are non-null by the time this function returns.
++            PBIosClaimShaderJob(prg);
++        }
++        autorelease_pool->release();
++        return (struct ShaderProgram*)prg;
++    }
++#else
+     NS::Error* error = nullptr;
+     MTL::Library* library =
+         mDevice->newLibrary(NS::String::string(buf.data(), NS::UTF8StringEncoding), nullptr, &error);
+@@ -314,6 +540,7 @@
+     autorelease_pool->release();
+ 
+     return (struct ShaderProgram*)prg;
++#endif
+ }
+ 
+ struct ShaderProgram* GfxRenderingAPIMetal::LookupShader(uint64_t shader_id0, uint64_t shader_id1) {
+@@ -326,9 +553,16 @@
+     struct ShaderProgramMetal* prg = &it->second;
+ 
+     if (prg->markedForDeletion) {
++        // PAPERBOAT_IOS (overlay 0027): erasing is safe with a compile in
++        // flight - the entry holds only a reference to the job, and the worker
++        // writes into the job, never into the entry.
+         mShaderProgramPool.erase(it);
+         return nullptr;
+     }
++
++#ifdef __IOS__
++    PBIosClaimShaderJob(prg);
++#endif
+ 
+     return it == mShaderProgramPool.end() ? nullptr : (struct ShaderProgram*)&it->second;
+ }
+@@ -691,10 +925,28 @@
+     current_framebuffer.mCommandEncoder->setCullMode(cull);
+ 
+     if (current_framebuffer.mLastShaderProgram != mShaderProgram) {
+-        current_framebuffer.mLastShaderProgram = mShaderProgram;
+-
++#ifdef __IOS__
++        // PAPERBOAT_IOS (overlay 0027): deliver the async compile here, on the
++        // render thread. The worker only ever published into its own job.
++        PBIosClaimShaderJob(mShaderProgram);
++#endif
+         MTL::RenderPipelineState* pipeline_state =
+             mShaderProgram->pipeline_state_variants[current_framebuffer.mMsaaLevel];
++#ifdef __IOS__
++        // The compile has not landed yet - skip this draw. Do NOT advance
++        // mLastShaderProgram (so the bind is retried on the next draw) and do
++        // NOT advance mCurrentVertexBufferOffset (the slot is reused).
++        // Everything above this point is idempotent per-draw encoder state, so
++        // the early return corrupts nothing; the geometry pops in a frame or
++        // two later instead of the frame stalling 150 ms. Never fires in the
++        // synchronous path - the variants are non-null by the time
++        // CreateAndLoadNewShader returns there.
++        if (pipeline_state == nullptr) {
++            autorelease_pool->release();
++            return;
++        }
++#endif
++        current_framebuffer.mLastShaderProgram = mShaderProgram;
+         current_framebuffer.mCommandEncoder->setRenderPipelineState(pipeline_state);
+     }
+ 

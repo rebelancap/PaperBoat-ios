@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Overlay patch 0029 - the widescreen camera fit finishes the job vertically.
+
+CLASS: (b) upstream bug fix worth sending. NOT iOS-gated: it is a rendering
+correctness fix, and gating it would put the macOS oracle (the spec's ground
+truth) permanently out of parity with the phone.
+
+THE BUG THE USER SAW ON 0.0.0.8
+-----------------------------
+"Why does the game have black letterboxing at the top and bottom?"
+
+Measured on the simulator in real gameplay (Mario's house, loaded from a save)
+at a 2736x1260 drawable: a black band of EXACTLY 105 px top and bottom.
+105/1260 = 20/240 = PM64's own `SCREEN_INSET_Y`. A/B'd with this patch as the
+only difference, same save, same scene, same config: 105/105 without it, 0/0
+with it (the measurement log M-027, artifacts/sim/m027-d vs m027-f). Unchanged at SSAA
+1.00x and 2.00x, so overlay 0019 is not involved, and there is no `__IOS__`
+branch anywhere in the path, so the platform is not either.
+
+THE CHAIN, EXACTLY
+------------------
+1. `world.c:225` gives the world camera `set_cam_viewport(CAM_DEFAULT, 12, 20,
+   296, 200)`. At 4:3 that is Paper Mario's own black margin - 12 native px at
+   the sides, 20 top and bottom - and it is authentic; the game is drawn inside
+   a frame.
+2. `cam_is_framed()` is FALSE once the view is wider than 4:3
+   (`cam_view_is_widened()`), with upstream's own comment saying why: "The world
+   and battle cameras are drawn inside a black margin, but only at 4:3 or
+   narrower: a wider view has no margin to draw."
+3. But the branch that then runs - `cam_widescreen_fit_viewport`'s
+   `camID == CAM_DEFAULT || CAM_BATTLE` case - only fixes up X:
+   `vscale[0] = 2*SCREEN_WIDTH`, `vtrans[0] = 4*(SCREEN_WIDTH/2)`. `vscale[1]`
+   and `vtrans[1]` keep `set_cam_viewport`'s values, i.e. a 200-tall viewport
+   centred at 120. And `render_frame`'s scissor takes `ulx`/`lrx` from
+   `get_cam_scissor_x` (widened to 0..SCREEN_WIDTH by
+   `cam_has_fullscreen_viewport`) while `uly`/`lry` are still
+   `viewportStartY` .. `+viewportH` = 20 .. 220.
+
+So at wide aspect the margin is removed on the left and right and left in place
+top and bottom. That is the letterbox, and upstream's own comment says it was
+not meant to be there.
+
+IT IS ALSO A 20 % VERTICAL STRETCH, WHICH IS THE SECOND ARGUMENT FOR FIXING IT
+------------------------------------------------------------------------------
+The projection's aspect is `GameEngine_GetAspectRatio()` =
+`mCurDimensions.aspect_ratio` = the whole drawable (2.171 on an iPhone Air).
+The viewport it is rendered into was the whole width by 200/240 of the height,
+i.e. 2736x1050 = 2.606. Screen pixels per NDC unit therefore differed between
+the axes by 2.606/2.171 = 1.20 = 240/200: every widescreen frame was drawn 20 %
+too tall. Filling the viewport vertically makes it 2736x1260 = 2.171, which is
+exactly the projection's aspect - so this patch removes a geometric distortion
+and the black bands with the same two hunks.
+
+WHAT IT DELIBERATELY DOES NOT TOUCH
+-----------------------------------
+* `camera->viewportStartY` / `viewportH` (the FIELDS) are unchanged, exactly as
+  upstream leaves `viewportStartX` / `viewportW` unchanged and adjusts only
+  `vp`. Everything that reads the fields - the background clamp in
+  `background_gfx.c:421-430`, `get_screen_coords`, the transition stencils -
+  keeps working off the numbers the map gave it.
+* Cinematic and sub-viewport cameras. Both hunks require
+  `viewportH >= SCREEN_HEIGHT - 2 * SCREEN_INSET_Y` (i.e. the standard 200-tall
+  world/battle viewport), so the game's OWN letterboxes - the demo camera's
+  177-tall viewport (`state_demo.c:234`), the file-select and title's 184
+  (`state_file_select.c:65`), the intro's 162 (`world.c:227`) and every
+  `cam_api` viewport an event script sets for a cutscene - are untouched and
+  still frame themselves the way the game intends. Verified: the title and file
+  select still letterbox in M-027, the attract demo still plays on its stage.
+* 4:3 and narrower. `cam_view_is_widened()` gates the scissor hunk, and the
+  viewport hunk only runs in the branch `cam_is_framed()` already excludes 4:3
+  from. A 4:3 window keeps Paper Mario's black frame on all four sides.
+
+WHERE THE HUNKS SIT
+-------------------
+Two hunks in `src/cam_main.c`, which no other patch in the series touches:
+`cam_widescreen_fit_viewport`'s CAM_DEFAULT/CAM_BATTLE branch (~:163) and
+`render_frame`'s scissor block (~:229).
+
+Match-count asserted against the pristine vendor state.
+"""
+import subprocess, pathlib, tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VENDOR = ROOT / "vendor/PaperBoat"
+REL = "src/cam_main.c"
+OUT = ROOT / "overlay/patches/0029-paperboat-widescreen-vertical-fit.patch"
+
+src = VENDOR / REL
+orig = src.read_text()
+
+
+def replace_once(t, old, new, tag):
+    n = t.count(old)
+    assert n == 1, f"{REL}: expected 1 match of {tag}, got {n}"
+    return t.replace(old, new)
+
+
+OLD_FIT = """    if (camID == CAM_DEFAULT || camID == CAM_BATTLE) {
+        camera->vp.vp.vscale[0] = 2.0f * SCREEN_WIDTH;
+        camera->vp.vp.vtrans[0] = 4 * (SCREEN_WIDTH / 2);
+        camera->vpAlt.vp.vscale[0] = camera->vp.vp.vscale[0];
+        camera->vpAlt.vp.vtrans[0] = gGameStatusPtr->altViewportOffset.x + camera->vp.vp.vtrans[0];
+        return;
+    }
+"""
+
+NEW_FIT = """    if (camID == CAM_DEFAULT || camID == CAM_BATTLE) {
+        camera->vp.vp.vscale[0] = 2.0f * SCREEN_WIDTH;
+        camera->vp.vp.vtrans[0] = 4 * (SCREEN_WIDTH / 2);
+        camera->vpAlt.vp.vscale[0] = camera->vp.vp.vscale[0];
+        camera->vpAlt.vp.vtrans[0] = gGameStatusPtr->altViewportOffset.x + camera->vp.vp.vtrans[0];
+        // PAPERBOAT (overlay 0029): and the same for Y. Without this the widened
+        // view keeps the 4:3 frame's 20-row margin top and bottom - which is the
+        // black letterboxing on a phone - AND renders 240/200 = 20% too tall,
+        // because the projection's aspect is the whole drawable while the
+        // viewport it lands in is only 200 of 240 rows. Filling the viewport
+        // makes the two agree.
+        //
+        // Only for a camera that is already showing the standard full-size
+        // world/battle view: a narrower viewport is the game framing a cutscene
+        // (state_demo's 177, the file select's 184, the intro's 162, anything
+        // cam_api sets), and that letterbox is deliberate.
+        if (camera->viewportH >= SCREEN_HEIGHT - 2 * SCREEN_INSET_Y) {
+            camera->vp.vp.vscale[1] = 2.0f * SCREEN_HEIGHT;
+            camera->vp.vp.vtrans[1] = 4 * (SCREEN_HEIGHT / 2);
+            camera->vpAlt.vp.vscale[1] = camera->vp.vp.vscale[1];
+            camera->vpAlt.vp.vtrans[1] = gGameStatusPtr->altViewportOffset.y + camera->vp.vp.vtrans[1];
+        }
+        return;
+    }
+"""
+
+OLD_SCISSOR = """            get_cam_scissor_x(camID, &ulx, &lrx);
+            uly = camera->viewportStartY;
+            lry = uly + camera->viewportH;
+"""
+
+NEW_SCISSOR = """            get_cam_scissor_x(camID, &ulx, &lrx);
+            uly = camera->viewportStartY;
+            lry = uly + camera->viewportH;
+
+            // PAPERBOAT (overlay 0029): the Y half of the widescreen fit. X is
+            // already widened to the true screen edges by get_cam_scissor_x;
+            // without this the scissor would clip the now-full-height viewport
+            // back to the 4:3 frame's 20-row margin and the letterboxing would
+            // survive the fix above. Same guards, for the same reason.
+            if (cam_view_is_widened() && cam_has_fullscreen_viewport(camID)
+                && camera->viewportH >= SCREEN_HEIGHT - 2 * SCREEN_INSET_Y) {
+                uly = 0;
+                lry = SCREEN_HEIGHT;
+            }
+"""
+
+text = replace_once(orig, OLD_FIT, NEW_FIT, "cam_widescreen_fit_viewport CAM_DEFAULT branch")
+text = replace_once(text, OLD_SCISSOR, NEW_SCISSOR, "render_frame scissor")
+
+with tempfile.NamedTemporaryFile("w", suffix=".a", delete=False) as fa, \
+     tempfile.NamedTemporaryFile("w", suffix=".b", delete=False) as fb:
+    fa.write(orig); fb.write(text); fa.flush(); fb.flush()
+    r = subprocess.run(["diff", "-u", "--label", f"a/{REL}", "--label", f"b/{REL}",
+                        fa.name, fb.name], capture_output=True)
+assert r.returncode == 1, "diff produced no change"
+
+OUT.write_text(__doc__ + "\n" + r.stdout.decode())
+print(f"wrote {OUT}")

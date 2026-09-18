@@ -1,0 +1,86 @@
+Overlay patch 0030 - CADisableMinimumFrameDurationOnPhone, so ProMotion can reach 120.
+
+CLASS: (a) program-baseline parity.
+
+WHY
+---
+iOS caps an app at 60 Hz on a ProMotion display unless its Info.plist opts in.
+Without the opt-in, Settings > iOS > Max Frame Rate 120 (overlay 0021/0023) can
+never be reached on the hardware that has the panel for it: the engine would
+happily interpolate for 120 and the compositor would present 60.
+
+REV 2 (round 16) - THE KEY NAME WAS WRONG, AND IT IS THE WHOLE 60 Hz STORY
+--------------------------------------------------------------------------
+Rev 1 shipped `CADisableMinimumFrameDuration`. That is the IPAD key (iOS 10.3,
+iPad Pro). **On an iPhone the key is `CADisableMinimumFrameDurationOnPhone`**
+(iOS 15, iPhone 13 Pro onwards), and nothing else opts a phone out of the 60 Hz
+minimum frame duration. The user's 0.0.0.9 device read is exactly what the wrong
+key looks like: interpolation target 120 (`ipf=4.00`), presents pinned to 60
+(`wall_ms p50=16.69` - the 60 Hz period to two decimal places) and therefore the
+game ticking at 15 Hz instead of 30 with the audio thread starving behind it
+(961 underruns).
+
+Two independent confirmations, both already on this machine:
+
+  * SDL 2 says so in its own source, in the comment above the high-refresh
+    display link it only creates when the desktop mode is above 60:
+    `build-sim/_deps/sdl2-src/src/video/uikit/SDL_uikitviewcontroller.m:122-125`
+    - "To enable this on phones, you should add the following line to Info.plist:
+    `<key>CADisableMinimumFrameDurationOnPhone</key> <true/>`".
+  * **Every sibling ships the OnPhone key**, and the SoH port measured a locked
+    120 with it: `Shipwright-ios/scripts/gen-patch-0004-0005.py`,
+    `Lighthouse-ios/scripts/gen-patch-0004-0005.py`, and
+    the SoH port's measurement log ("wall p50 8.32 ms, rendered fps
+    119.9-120.0 ... the CADisableMinimumFrameDurationOnPhone plist key + SDL
+    display path + engine pacer compose correctly out of the box").
+
+Rev 2 therefore ships BOTH keys - the OnPhone one because that is what an iPhone
+reads, and the original because it is what an iPad Pro reads and this bundle
+installs on both. Neither has any effect on a 60 Hz device.
+
+This has been a follow-up line in `docs/parity-checklist.md` since round 11,
+deliberately not bundled blind. It lands now because round 15 also makes the
+interpolation target follow the display's refresh rate (overlay 0023 rev 2):
+with that in place, this key is the difference between a fresh install running
+at 60 on an iPhone Air and running at 120.
+
+It is one boolean and it cannot be verified on the simulator, which has no
+ProMotion panel - `xcrun simctl` reports a 60 Hz display. What IS verified on
+the simulator is that the key is present in the built bundle's Info.plist and
+that the app still launches, which is what `scripts/build-sim.sh` plus a
+`plutil -extract` assertion cover. The 120 itself is a device reading.
+
+WHERE THE HUNK SITS
+-------------------
+`ios/plist.in` is edited by three other patches: overlay 0005 at pristine lines
+5-11 and 18-30 (branding and version), overlay 0001 at 36-41 (the UIScene
+manifest), overlay 0009 at 54-58 (the URL scheme). This hunk is anchored on
+`UIViewControllerBasedStatusBarAppearance` (pristine 45-46) and so spans 44-49 -
+clear of all three, which is what keeps apply-overlay.sh's reverse-probe
+("already applied") working when two patches share a context line.
+
+Match-count asserted against the pristine vendor state.
+
+--- a/ios/plist.in
++++ b/ios/plist.in
+@@ -44,6 +44,20 @@
+ 	<true/>
+ 	<key>UIViewControllerBasedStatusBarAppearance</key>
+ 	<false/>
++	<!-- PAPERBOAT_IOS (overlay 0030 rev 2): opt out of the 60 Hz minimum frame
++	     duration. Without this iOS refuses to present faster than 60 on a
++	     ProMotion panel no matter what the app asks for, so Settings > iOS >
++	     Max Frame Rate 120 could never be reached on the hardware that has the
++	     display for it.
++	     BOTH keys, deliberately: an iPHONE reads ...OnPhone (iOS 15, iPhone 13
++	     Pro onwards) and reading the iPad key alone is what pinned 0.0.0.9 to 60
++	     with the engine interpolating for 120 (ipf 4, tps 15 - half speed). An
++	     iPad Pro reads the shorter key. Neither does anything on a 60 Hz
++	     device. -->
++	<key>CADisableMinimumFrameDurationOnPhone</key>
++	<true/>
++	<key>CADisableMinimumFrameDuration</key>
++	<true/>
+ 	<key>UISupportedInterfaceOrientations</key>
+ 	<array>
+ 		<string>UIInterfaceOrientationLandscapeLeft</string>

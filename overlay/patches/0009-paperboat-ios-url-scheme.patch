@@ -1,0 +1,59 @@
+Overlay patch 0009 — the paperboat:// URL scheme.
+
+CLASS: (a) program-baseline parity.
+
+Upstream's `ios/plist.in` has no `CFBundleURLTypes`, so the app owns no scheme
+and nothing outside it can ask it to do anything. The program wants deep links
+from day one (spec Phase 1, the q2repro/SoH port pattern): they are how a
+Shortcut, a home-screen link, an App Intent or `xcrun simctl openurl` reaches a
+running or a dead app, and on this port they are also the only way to turn the
+console bridge on from a device with no Mac attached.
+
+The plist half is this patch; the behaviour is in the shell
+(`app/ios/PaperBoatIosShell.m`), which queues every incoming URL and drains it
+when the engine is ready:
+
+    paperboat://launch            bring the app up (the App Intent's verb)
+    paperboat://console           start the bridge on :8771 (dev builds only)
+    paperboat://console?cmd=...   …and run one console command
+
+The identifier is the bundle id and the scheme is the port's own name; both are
+what every sibling registers, and the scheme is the one the program reserved for
+this port.
+
+Two delivery details that cost the siblings a day each, and are handled in the
+shell rather than here:
+
+  * Under a scene session UIKit delivers URL opens ONLY through
+    `scene:openURLContexts:` — the legacy `application:openURL:` never fires,
+    and SDL's app delegate has no URL code of its own anyway.
+  * A COLD launch through a link does not use that method at all: the URL
+    arrives in `scene:willConnectToSession:options:`'s connectionOptions. An
+    app that only implements the first one silently just launches.
+
+--- a/ios/plist.in
++++ b/ios/plist.in
+@@ -54,5 +54,23 @@
+ 		<string>UIInterfaceOrientationLandscapeLeft</string>
+ 		<string>UIInterfaceOrientationLandscapeRight</string>
+ 	</array>
++	<!-- PAPERBOAT_IOS: the port's URL scheme. paperboat://launch is the one-tap
++	     entry point (App Intents / Shortcuts / a home-screen link);
++	     paperboat://console[?cmd=...] enables the dev console bridge on :8771 and
++	     is not a recognised link at all in a release build, which compiles the
++	     bridge out. Handling lives in app/ios/PaperBoatIosShell.m. -->
++	<key>CFBundleURLTypes</key>
++	<array>
++		<dict>
++			<key>CFBundleURLName</key>
++			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
++			<key>CFBundleTypeRole</key>
++			<string>Editor</string>
++			<key>CFBundleURLSchemes</key>
++			<array>
++				<string>paperboat</string>
++			</array>
++		</dict>
++	</array>
+ </dict>
+ </plist>

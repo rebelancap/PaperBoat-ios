@@ -1,0 +1,172 @@
+Overlay patch 0013 — safe-area insets for the engine-drawn touch pad (iOS).
+
+CLASS: (a) program-baseline parity. (Also a candidate upstream contribution:
+nothing in it is PaperBoat-ios-specific except the name of the shell symbol.)
+
+THE PROBLEM
+-----------
+Upstream draws its touch pad in the engine (`src/port/ui/TouchControls.cpp`),
+laid out against ImGui's `DisplaySize`, and anchors its elements hard in the
+corners: A at `(w - 2.6u, h - 3.0u)`, the menu button at `(2.0u, 1.8u)`, the
+L/R/Z bars at `1.6u`/`3.4u` from the top. On the simulator that is fine,
+because a simulator screen is a rectangle. On a real iPhone it is not: in
+landscape the sensor housing eats ~59 pt off the leading edge and the home
+indicator ~21 pt off the bottom, so the menu button or L sits *under the
+housing* and Start sits *under the home indicator* — untappable, and on the
+bottom edge competing with the system's own swipe-up gesture.
+
+The engine cannot see any of this. `UIWindow.safeAreaInsets` is UIKit's, and
+this LUS fork has no route from UIKit to the game. So the shell publishes the
+insets and this patch spends them.
+
+THE SHELL SIDE (no patch — it is our own file)
+----------------------------------------------
+`app/ios/PaperBoatIosShell.m` exports
+
+    void PBIos_GetSafeAreaInsets(float* top, float* left, float* bottom, float* right);
+
+the same linkage pattern overlay 0008 uses for `PBIos_IsBackgrounded` and 0012
+for `PBIos_ThermalState`: a C symbol with a stable name, declared at file scope
+on the engine side. It recomputes from the scene's key window whenever it is
+called on the main thread (which is every frame — the game loop IS the main
+thread on iOS), so rotation and scene reconnects need no notification plumbing,
+and it logs every change with the window, its frame, the scale and the pixels
+handed over (spec rule 6: a UIKit placement claim needs the view logging its
+own frame).
+
+**The insets arrive in DRAWABLE PIXELS, not points.** This fork runs ImGui and
+all window geometry in drawable pixels on iOS (`Fast3dGui.cpp` sets
+`io.DisplaySize` from `SDL_GetRendererOutputSize` with
+`DisplayFramebufferScale = (1,1)` — docs/lus-divergence.md), and
+`ComputeLayout` lays out against exactly that space. Points would be wrong by
+the screen scale — 3x on every current iPhone — which would look like the fix
+doing almost nothing rather than like a unit bug.
+
+WHAT THE PATCH DOES — THREE SMALL THINGS
+----------------------------------------
+1. `SafeRect()` — the one place that reads the shell. Off iOS it reports the
+   full display, so **zero-inset behaviour is byte-identical to today** and the
+   macOS oracle compiles and behaves unchanged.
+
+2. `SafeDefault()` inside `LoadPos`, applied to the FALLBACK ONLY. Every
+   element's default — the 15 buttons, the stick rest, the menu button — is
+   already routed through `LoadPos`, so one line covers the whole pad. A saved
+   custom position (`gTouchControls.Layout.<id>.{X,Y}`) takes the early return
+   above and is never touched: **the user's layout always wins**, which is also
+   what stops this patch from silently rewriting layouts people already made.
+
+   The transform is a linear remap of the full display rect onto the safe rect
+   (`x' = left + x * safeW / w`), not a per-edge "if it is near an edge, push
+   it in". Both put every default inside the safe rect; the remap does it
+   without a near-an-edge threshold to tune, keeps the relative arrangement of
+   the pad exactly as upstream drew it, and does something sensible for the
+   centre-anchored elements (Start at `w * 0.5`) instead of having to pick a
+   side for them. The cost is that gaps shrink by the inset fraction (~3 % on
+   an iPhone Air) — invisible, and in the right direction.
+
+3. The layout editor clamps drags to the safe rect instead of to `(0..w,
+   0..h)`, so a user cannot park a button under the housing by hand either.
+   Not cosmetic: `SavePos` normalizes against the FULL display, so an
+   unclamped drag writes a position that no later inset handling can rescue.
+
+WHAT IT DELIBERATELY DOES NOT DO
+--------------------------------
+* Element SIZES are untouched. Positions are the safety problem; sizes are a
+  taste problem, and overlay 0014 is where the default arrangement is argued.
+* The edit-mode Done/Reset pills and the hint text are top-centre, where the
+  landscape inset is zero on every iPhone; they stay where upstream put them
+  rather than being dragged into a patch hunk that would collide with 0014's.
+  (`apply-overlay.sh` probes "already applied" by reverse-applying at fuzz=0,
+  so two patches sharing context lines break the SECOND build — spec trap.)
+
+--- a/src/port/ui/TouchControls.cpp
++++ b/src/port/ui/TouchControls.cpp
+@@ -100,8 +100,58 @@
+ 
+ void LayoutKey(char* out, size_t outSize, const char* id, const char* axis) {
+     snprintf(out, outSize, CVAR_TOUCH("Layout.%s.%s"), id, axis);
++}
++
++#if defined(PLATFORM_IOS) || defined(__IOS__)
++// PAPERBOAT_IOS (overlay 0013): the app shell's safe-area insets, in DRAWABLE
++// PIXELS — the space this file lays out in, because this fork runs ImGui in
++// drawable pixels on iOS (Fast3dGui sets DisplayFramebufferScale to (1,1) and
++// DisplaySize from SDL_GetRendererOutputSize). Declared at file scope: a
++// linkage specification may not sit inside a function.
++extern "C" void PBIos_GetSafeAreaInsets(float* top, float* left, float* bottom, float* right);
++#endif
++
++// The usable screen rectangle. On iOS the sensor housing and the home
++// indicator carve real estate out of the display in landscape (~59 pt leading,
++// ~21 pt bottom on a modern iPhone), and a control drawn under either is
++// untappable — the bottom one also fights the system's swipe-up gesture.
++// Everywhere else, and on an iOS screen with no insets, this is the full
++// display and every number below is unchanged.
++void SafeRect(float w, float h, float& x0, float& y0, float& x1, float& y1) {
++    x0 = 0.0f;
++    y0 = 0.0f;
++    x1 = w;
++    y1 = h;
++#if defined(PLATFORM_IOS) || defined(__IOS__)
++    float top = 0.0f, left = 0.0f, bottom = 0.0f, right = 0.0f;
++    PBIos_GetSafeAreaInsets(&top, &left, &bottom, &right);
++    // Defensive: a nonsense inset (a window mid-rotation, say) must never
++    // collapse the rect and stack the whole pad in one spot.
++    if (left >= 0.0f && right >= 0.0f && top >= 0.0f && bottom >= 0.0f && (w - left - right) > w * 0.5f &&
++        (h - top - bottom) > h * 0.5f) {
++        x0 = left;
++        y0 = top;
++        x1 = w - right;
++        y1 = h - bottom;
++    }
++#endif
+ }
+ 
++// Maps a DEFAULT position, expressed against the full display, into the safe
++// rect. A linear remap rather than a per-edge nudge: it needs no
++// near-an-edge threshold, it keeps upstream's arrangement intact, and it does
++// the right thing for the centre-anchored elements (Start) instead of having
++// to choose a side for them. With no insets it is the identity.
++ImVec2 SafeDefault(ImVec2 c, float w, float h) {
++    float x0, y0, x1, y1;
++    SafeRect(w, h, x0, y0, x1, y1);
++    if (w > 1.0f && h > 1.0f) {
++        c.x = x0 + c.x * ((x1 - x0) / w);
++        c.y = y0 + c.y * ((y1 - y0) / h);
++    }
++    return c;
++}
++
+ // Custom positions are stored normalized (0..1 of display) so they survive
+ // resolution and orientation changes.
+ ImVec2 LoadPos(const char* id, ImVec2 fallback, float w, float h) {
+@@ -111,9 +161,11 @@
+     const float nx = CVarGetFloat(kx, -1.0f);
+     const float ny = CVarGetFloat(ky, -1.0f);
+     if (nx >= 0.0f && ny >= 0.0f) {
++        // A layout the user made themselves wins outright, insets included:
++        // they placed it where their thumbs are, looking at their own screen.
+         return ImVec2(nx * w, ny * h);
+     }
+-    return fallback;
++    return SafeDefault(fallback, w, h);
+ }
+ 
+ void SavePos(const char* id, ImVec2 center, float w, float h) {
+@@ -388,8 +440,14 @@
+             sDragTarget = -1;
+             return;
+         }
+-        sDragPos =
+-            ImVec2(std::clamp(held->pos.x + sDragOffset.x, 0.0f, w), std::clamp(held->pos.y + sDragOffset.y, 0.0f, h));
++        // Clamp to the SAFE rect, not to the display: SavePos normalizes against
++        // the full display, so a drag parked under the sensor housing writes a
++        // position no later inset handling can rescue (overlay 0013).
++        float sx0, sy0, sx1, sy1;
++        SafeRect(w, h, sx0, sy0, sx1, sy1);
++        sDragPos = ImVec2(
++            std::clamp(held->pos.x + sDragOffset.x, sx0, sx1), std::clamp(held->pos.y + sDragOffset.y, sy0, sy1)
++        );
+         if (sDragTarget >= 0 && sDragTarget < (int) state.gameButtons.size()) {
+             state.gameButtons[sDragTarget].center = sDragPos;
+         } else if (sDragTarget == -2) {

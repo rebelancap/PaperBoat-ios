@@ -1,0 +1,1267 @@
+#!/usr/bin/env python3
+"""Overlay patch 0012 — the Phase 0.3 measurement harness (iOS frame probe).
+
+CLASS: (a) program-baseline parity — EXCEPT the `PBIosPace` block added in
+REV 5, which is (b) an upstream bug fix worth sending. That block is fenced and
+labelled in the source so the upstream-bump drill can lift it on its own; it is
+in this patch, and not a patch of its own, because it must edit this patch's own
+four-line hunk in `GameEngine::RunCommands`, and `apply-overlay.sh` detects
+"already applied" by reverse-applying at fuzz 0 — two patches cannot share those
+lines (the porting notes).
+
+REV 7 (round 22): THE TEXTURE CACHE'S LEDGER. Overlay 0037 gives the cache a
+real `DeleteTexture` and a byte budget; its four counters (entries, resident
+bytes, budget, cumulative evictions) ride in a `texcache` group on the `fps`
+line and answer the bridge's new `texcache` verb through
+`PBIos_TexCacheReport`. Nothing else in the harness changed.
+
+REV 6 (round 20): ONE WINDOW OF EVIDENCE, AND A ONE-SHOT STALL.
+`PBIos_PerfStepWindow()` returns the tick rate, the cumulative hold and
+sub-frame-skip counters and the largest present and loop period over one
+caller-chosen window, all under one lock — that is the whole input to overlay
+0023 rev 5's redesigned step policy, which measures the HARM (tps falling while
+the skip cannot keep up) instead of the symptom (a late present, which since
+rev 5 costs an intermediate view and nothing else). The window also has to be
+able to say "this was a LOAD, not a slow frame", which is what the hold counter
+and the two maxima are for. Second addition: `gSohIos.DebugPresentDelayOnceMs`,
+a one-shot present stall that disarms itself — 21000 reproduces the launch-time
+21 s stall that stepped the user's 0.0.0.14 phone down to 60 Hz for the rest of
+the session (M-032 §1, `loop_max=21139`).
+
+REV 5 (round 18): A LATE PRESENT NOW DROPS A SUB-FRAME INSTEAD OF DELAYING THE
+TICK. One 30 Hz tick is expanded into target/30 presented sub-frames, and the
+tick cannot end until the last of them is presented — so a missed vsync slot
+did not cost a frame, it slowed the GAME. The user's 0.0.0.12 device read (2x
+SSAA, 120 Hz panel, thermal 0) is the case: `wall_ms p50=8.33 p95=16.57`, one
+slot lost in twenty, and `tps=26.49/30` — 88 % speed, which he reported as
+"seems smooth, 120 fps, but it dips to the 90s as I move". Sub-frame `i` of a
+tick now has a due time on a 30 Hz metronome, and an intermediate sub-frame
+already past the end of its slot is never built and never presented. The LAST
+sub-frame of a tick (the key frame, interpolation 1.0) is never dropped, so the
+displayed state never lags the simulation. `subskip=` joins the report line;
+`tps` reads 30.0 while skips happen; `ipf` falls below the target/30 it used to
+assert. The full argument, the two diagnostic CVars and the audio note are in
+the source comment above `namespace PBIosPace`.
+
+program spec Phase 0.3: "Build the measurement harness before the port" —
+wall p50/p95, engine-frame p50/p95 (named honestly, because it includes
+in-call blocking), OS thermal state, and a sim-rate metric. Until this exists
+there is no fps number on iOS and nothing in Phase 3 can start. This is the
+SoH port's overlay 0008 (+0028's GPU probe) re-authored for PaperBoat; none of
+its hunks apply, since the anchors live in a different engine.
+
+REV 3 (round 16): three additions, all so a device read can settle the 120 Hz
+question in one line.
+
+FIRST, AND THE ONE THAT MATTERED: `gpu_ms` WAS NEVER THE GAME. It samples
+`mFramebuffers[0]`, and on this fork that command buffer holds only the ImGui
+composite and the `presentDrawable` — every framebuffer gets its OWN command
+buffer (`StartDrawToFramebuffer`) and `EndFrame` commits the others separately,
+so the supersampled 5472x2520 game pass and PM64's per-frame framebuffer copy
+were both invisible, while the present wait was folded in. The user's 0.0.0.9
+`gpu_ms p50=11.62` therefore does NOT mean "the GPU needs 11.6 ms"; on a
+60 Hz-locked present it is mostly the wait. Rev 3 adds **`gpu_game_ms`**: the
+same GPUEndTime-GPUStartTime handler on every NON-screen command buffer of the
+frame, summed and drained per present. That is the number that prices 2x
+supersampling. `PBIos_PerfPresentPeriod()` exposes the median present
+period over the most recent ~1 s (a WINDOW, not the 8.5 s ring) plus a monotonic
+present counter - that is the input to overlay 0023 rev 3's auto-step-down, which
+must never make a second decision on data from before its last one. And `msaa=`
+joins the report line: at 2x supersampling this port renders 5472x2520, where a
+non-1 `gMSAAValue` is a multi-millisecond difference, and the number was
+invisible.
+
+WHERE IT HOOKS, AND WHY (see docs/frame-map.md)
+-----------------------------------------------
+PaperBoat has ONE game thread. `step_game_loop()` runs the 30 Hz tick, then
+`Graphics_PushFrame` hands the finished master display list to
+`GameEngine::ProcessGfxCommands`, which expands it into
+`mtx_replacements.size()` interpolated sub-frames and hands those to
+`RunCommands`, which calls `DrawAndRunGraphicsCommands` once per sub-frame —
+and that call is the one that ends in `presentDrawable` + `commit`. So:
+
+  * ONE `ProcessGfxCommands` call == ONE game tick  -> `OnTick()`
+  * ONE `DrawAndRunGraphicsCommands` call == ONE present -> `OnFrame()`
+
+Both hooks therefore sit in `src/port/Engine.cpp`, which is the anchor
+`docs/lus-divergence.md` row 0008 names.
+
+WHAT EACH NUMBER MEANS
+----------------------
+  wall_ms   present-to-present interval, measured at the top of consecutive
+            `DrawAndRunGraphicsCommands` calls. This is the frame time a
+            player feels. p50/p95/p99/max.
+  eng_ms    time spent INSIDE `DrawAndRunGraphicsCommands`. Named `eng`, not
+            `cpu`, on purpose: it includes drawable back-pressure, so it is
+            not "CPU work". The whole diagnostic value is in the comparison —
+            **wall ~= eng means the frame is spent BLOCKED INSIDE the present
+            call** (GPU-bound, or the compositor pacing us), while
+            **wall >> eng means the time goes to code outside the render
+            call** (the game tick, interpolation, audio join).
+  gpu_ms    true GPU duration of the frame's screen command buffer
+            (`GPUEndTime - GPUStartTime`), sampled in a Metal completion
+            handler. This is what separates "the GPU is saturated" from "the
+            GPU is idle and we are waiting on pacing" — a distinction neither
+            wall nor eng can make. Last-sample-wins, so it lags by a frame;
+            that is fine for a percentile over hundreds of frames.
+  fps       presents per wall second, derived from the wall ring
+            (n / sum(wall_ms) * 1000) rather than from a stopwatch, so it
+            describes exactly the frames the percentiles describe.
+  tps       game ticks per wall second, from a separate ring of tick
+            timestamps. **PM64's native rate is 30** (`Engine.cpp` hard-codes
+            `int original_fps = 60 / 2;` — docs/frame-map.md step 2), so the
+            report prints `tps=x/30`. This is the metric that turns "enemies
+            move in slow motion" into a number in one run: a tps below 30 with
+            a healthy fps means the sim is starving, not the renderer.
+  ipf       interpolated sub-frames per tick (fps/tps). 1.0 at a 30 fps
+            target, 2.0 at 60, 4.0 at 120 — a free assertion that the
+            interpolation target is what the settings claim.
+  thermal   `NSProcessInfo.thermalState`, 0..3, via the shell's
+            `PBIos_ThermalState`. Program measurement protocol: thermal state
+            rides in every report line, because a serious/critical reading
+            invalidates a comparison.
+
+STORAGE. Two fixed-size rings, no allocation after startup: 512 present
+samples (~8.5 s at 60 fps) and 128 tick timestamps (~4.3 s at 30 Hz). Cost per
+frame is one steady_clock read pair, three stores and an uncontended mutex —
+far below the thing being measured, so the probe is ALWAYS ON in sim and
+device builds rather than gated behind a flag nobody remembers to set.
+
+DELIVERY. `PBIos_PerfReport(char*, int)` formats one line; the shell's console
+bridge exposes it as the `fps` verb (`docs/console-bridge.md`), called on the
+main thread like every other bridge command. Setting `PAPERBOAT_PERF` in the
+environment additionally logs the same line through spdlog every 5 s, which is
+how a device run leaves a trace with nobody attached.
+
+The mutex is not paranoia about the game loop (both hooks run on it): it is
+what lets a report be taken from any thread later — a HUD, a future
+lock-free-ish reader — without re-auditing this file.
+
+REVISION 2 (round 13, the ~5 s stutter) — AUDIO AND COMPILE TELEMETRY
+---------------------------------------------------------------------
+The user's 0.0.0.5 device log carries 86 `audio queue underran` warnings in
+248 s (34 hitch events, median gap 3.6 s) and the `fps` line could say nothing
+about any of it. `docs/frame-map.md` shows why audio and video cannot hitch
+independently here: `gfx_frame.c:80` blocks the game thread on the audio cv
+every tick, and the reservoir is `DesiredBuffered = 1680` at 32 kHz = **52.5 ms**,
+so any main-thread frame longer than that drains the SDL queue and is heard and
+seen at the same instant. The probe now measures the reservoir and the two
+mechanisms most likely to overrun it:
+
+  aud_min/aud_max  SDL queued samples, sampled once per audio-thread wake (i.e.
+                   once per 30 Hz tick) at the moment the game thread is about
+                   to unblock. Min/max over a 256-sample ring. `aud_min` near 0
+                   IS the stutter; `aud_max` near 3360 (2x desired) is the
+                   skip-when-above guard doing its job.
+  underruns        cumulative count since launch of the `audio queue underran`
+                   condition. Counted rather than only logged, because overlay
+                   0026 rate-limits the log line (the warning itself was part of
+                   the problem: an async logger with `flush_on(warn)` blocking
+                   the audio thread while the game thread blocks on the audio cv
+                   is self-amplifying).
+  lib_ms/lib_n     Metal `newLibrary` time and count, summed over the frame ring.
+  pso_ms/pso_n     Metal `newRenderPipelineState` time and count, same window.
+                   These two are the H1 hypothesis made measurable: a cold
+                   shader compile is 120-160 ms per shader on A-series and this
+                   fork compiles synchronously on the game thread (overlay 0027
+                   fixes it; this patch only counts).
+  tex_up_n/tex_up_ms  `UploadTexture` count and time over the same window — the
+                   H3 hypothesis (`DeleteTexture` is an empty function, so the
+                   count-keyed LRU re-uploads what it evicted and never frees).
+
+WINDOWING, AND WHY THERE IS STILL NO RESET-ON-READ. D15's rule stands: `fps`
+must be askable twice without perturbing what it reports. So the four ledgers
+are atomics that the PRESENT hook drains into the frame ring (per-frame deltas),
+and the report SUMS the ring. The window is therefore the same window the
+percentiles describe, and two consecutive `fps` calls agree. `underruns` is the
+one exception and is honest about it: a monotonic count since launch.
+
+THE TICK-PHASE SPLIT (same revision). `wall_ms` alone cannot tell a slow game
+tick from a frame that was never presented at all: `Graphics_ThreadUpdate`
+returns early without submitting whenever `GLOBAL_OVERRIDES_DISABLE_DRAW_FRAME`
+is set ("hold the last image" — state transitions, demo scene changes, map
+loads), and `GameEngine_HoldFrame` then sleeps out the 30 Hz slot. A run of held
+frames looks exactly like a 600 ms hitch in `wall_ms` and drags `tps` down with
+it, because both hooks hang off the PRESENT path. So the probe now takes three
+more numbers straight off `gfx_frame.c`:
+
+  tick_max     longest `step_game_loop()` in the window (the game's own code —
+               map loads, archive reads, effect allocation).
+  audwait_max  longest `GameEngine_EndAudioFrame()` — the game thread's block on
+               the audio cv (`docs/frame-map.md`). Large here means the AUDIO
+               thread is the slow one; large `tick_max` with small `audwait_max`
+               means the game thread is, and the audio starves behind it.
+  dl_max       longest gap between the end of `step_game_loop()` and the start
+               of `GameEngine_EndAudioFrame()` — i.e. `gfx_task_background()` +
+               `gfx_draw_frame()`, where the display list is built and where
+               Fast3d resolves and loads textures out of the O2R archive.
+  loop_max     longest interval between consecutive game frames, measured at the
+               `step_game_loop()` mark. **This is the audio wake period**:
+               `GameEngine_StartAudioFrame()` is the first thing each frame
+               does, so a `loop_max` above the reservoir's 52.5 ms is an
+               underrun by arithmetic, wherever the time went.
+  holds        frames the engine deliberately did not present, since launch.
+
+`gfx_frame.c` is C, so all the timing lives here and the C file only calls
+`PBIos_PerfTickPhase(n)` — one extern, five call sites, no clock arithmetic in
+the C file at all.
+
+WHERE THE COUNTERS LIVE. The Metal ledgers are defined in `gfx_metal.cpp` next
+to `gPBIosGpuMs`, for the same reason: the writers are there, and libultraship
+is a static library linked under the app's own objects. `PBIos_PerfNoteUnderrun`
+goes the other way (defined here, called from the audio path by overlay 0026),
+so its declaration is planted above `HandleAudioThread` by this patch.
+
+UPSTREAMABLE: not as-is — it is iOS-only instrumentation for this program's
+measurement protocol. The `gPBIosGpuMs` probe in gfx_metal.cpp is, though.
+"""
+import subprocess, pathlib, tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VENDOR = ROOT / "vendor/PaperBoat"
+OUT = ROOT / "overlay/patches/0012-paperboat-ios-perf-harness.patch"
+
+LUS = "external/libultraship"
+EDITS = []
+
+# ------------------------------------------------------------- src/port/Engine.cpp
+PROBE = r'''#ifdef __IOS__
+// ---------------------------------------------------------------------------
+// PAPERBOAT_IOS_PERF (overlay 0012) — the Phase 0.3 measurement harness.
+//
+// One tick  = one GameEngine::ProcessGfxCommands call (PM64 ticks at 30 Hz).
+// One frame = one DrawAndRunGraphicsCommands call, which ends in
+//             presentDrawable + commit.
+//
+// wall_ms is present-to-present; eng_ms is the time inside the present call
+// and therefore INCLUDES in-call blocking (hence "eng", not "cpu"):
+//   wall ~= eng  -> blocked inside the render/present call (GPU or pacing)
+//   wall >> eng  -> time is going to code outside it (tick, interpolation)
+// gpu_ms is the real GPU duration of the screen command buffer, sampled by a
+// Metal completion handler in gfx_metal.cpp, and is the only one of the three
+// that can tell a saturated GPU from an idle one waiting on pacing.
+// ---------------------------------------------------------------------------
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <thread>
+
+// Thermal state lives in the app shell (app/ios/PaperBoatIosShell.m): the
+// program's measurement protocol puts NSProcessInfo.thermalState in every
+// report line, because a throttled run is not a comparable run.
+extern "C" int PBIos_ThermalState(void);
+// True GPU frame time, written by the Metal backend's completion handler.
+extern "C" volatile float gPBIosGpuMs;
+// Rev-3: the GAME framebuffer's GPU micros, summed per frame by gfx_metal.cpp
+// and drained here per present.
+extern "C" std::atomic<uint64_t> gPBIosGpuGameUs;
+// Rev-2 telemetry ledgers, defined beside gPBIosGpuMs in gfx_metal.cpp and
+// written by the Metal backend. Cumulative microseconds/counts; the present
+// hook below drains them into the frame ring, so the report's window is the
+// same window the percentiles describe (D15: no reset-on-read).
+extern "C" std::atomic<uint64_t> gPBIosShaderLibUs;
+extern "C" std::atomic<uint32_t> gPBIosShaderLibN;
+extern "C" std::atomic<uint64_t> gPBIosShaderPsoUs;
+extern "C" std::atomic<uint32_t> gPBIosShaderPsoN;
+extern "C" std::atomic<uint64_t> gPBIosTexUploadUs;
+extern "C" std::atomic<uint32_t> gPBIosTexUploadN;
+// Rev-4: the render-pass ledger (written by overlay 0033, defined beside the
+// others in gfx_metal.cpp). pass_skipped = render passes never encoded because
+// nothing drew into them; copy_n / copy_px = PM64's per-frame full-screen
+// framebuffer copies and the pixels they move.
+extern "C" std::atomic<uint32_t> gPBIosPassSkippedN;
+extern "C" std::atomic<uint32_t> gPBIosCopyN;
+extern "C" std::atomic<uint64_t> gPBIosCopyPx;
+// REV 7 (round 22): the texture cache's ledger, written by overlay 0037 in
+// fast/interpreter.cpp. Not atomics — they are plain volatile words there, for
+// the reason that file gives (no <atomic> include for four counters, and on
+// iOS the writer and the reader are the same thread).
+extern "C" volatile uint64_t gPBIosTexCacheEvicts;
+extern "C" volatile uint64_t gPBIosTexCacheBytes;
+extern "C" volatile uint32_t gPBIosTexCacheEntries;
+extern "C" volatile uint32_t gPBIosTexCacheBudgetMB;
+
+namespace PBIosPerf {
+
+constexpr int kFrameRing = 512; // ~8.5 s at 60 fps
+constexpr int kTickRing = 128;  // ~4.3 s at 30 Hz
+constexpr int kAudioRing = 256; // ~8.5 s at 30 Hz (one sample per audio wake)
+// Tick-phase ring: one entry per Graphics_ThreadUpdate, PRESENTED OR NOT — the
+// whole point is to see the frames the present hooks never hear about.
+constexpr int kPhaseRing = 256; // ~8.5 s at 30 Hz
+constexpr double kNativeTickHz = 30.0; // PM64: Engine.cpp's `60 / 2`
+
+using Clock = std::chrono::steady_clock;
+
+struct Probe {
+    std::mutex mutex;
+    double wallMs[kFrameRing] = {};
+    double engMs[kFrameRing] = {};
+    double gpuMs[kFrameRing] = {};
+    double gpuGameMs[kFrameRing] = {}; // rev-3: the non-screen framebuffers
+    int frameCount = 0; // total presents, saturating use of index % kFrameRing
+    double tickAt[kTickRing] = {};
+    int tickCount = 0;
+    // Rev-2: per-present deltas of the Metal ledgers, summed over the window.
+    double libUs[kFrameRing] = {};
+    unsigned int libN[kFrameRing] = {};
+    double psoUs[kFrameRing] = {};
+    unsigned int psoN[kFrameRing] = {};
+    double texUs[kFrameRing] = {};
+    unsigned int texN[kFrameRing] = {};
+    // Rev-4: the render-pass ledger, drained the same way.
+    unsigned int skipN[kFrameRing] = {};
+    unsigned int copyN[kFrameRing] = {};
+    double copyPx[kFrameRing] = {};
+    // Rev-2: the audio reservoir, one sample per audio-thread wake.
+    int audBuffered[kAudioRing] = {};
+    int audCount = 0;
+    std::atomic<unsigned int> underruns{ 0 };
+    // Rev-2: the tick-phase split (see the header). Written from the game
+    // thread inside Graphics_ThreadUpdate, one entry per game frame.
+    double phaseTickMs[kPhaseRing] = {};
+    double phaseAudWaitMs[kPhaseRing] = {};
+    int phaseCount = 0;
+    std::atomic<unsigned int> holds{ 0 };
+    // Rev-5: interpolated sub-frames dropped because the tick was already late
+    // (see PBIosPace below). Cumulative, like `holds` and `underruns` — the
+    // absolute number is what an A/B reads.
+    std::atomic<unsigned int> subSkips{ 0 };
+    Clock::time_point phaseTickT0{};
+    Clock::time_point phaseAudT0{};
+    Clock::time_point phaseTickEnd{};
+    Clock::time_point phasePrevStart{};
+    double phasePendingTickMs = 0.0;
+    double phasePendingDlMs = 0.0;
+    double phasePendingLoopMs = 0.0;
+    double phaseDlMs[kPhaseRing] = {};
+    double phaseLoopMs[kPhaseRing] = {};
+    Clock::time_point origin = Clock::now();
+    Clock::time_point lastPresent{};
+    Clock::time_point lastLog = Clock::now();
+
+    double Now() {
+        return std::chrono::duration<double>(Clock::now() - origin).count();
+    }
+
+    void OnFrame(double engineMs) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const Clock::time_point now = Clock::now();
+        if (lastPresent.time_since_epoch().count() != 0) {
+            const int i = frameCount % kFrameRing;
+            wallMs[i] = std::chrono::duration<double, std::milli>(now - lastPresent).count();
+            engMs[i] = engineMs;
+            gpuMs[i] = (double)gPBIosGpuMs;
+            gpuGameMs[i] = (double)gPBIosGpuGameUs.exchange(0) / 1000.0;
+            // Rev-2: drain the Metal ledgers into this frame's slot. exchange
+            // is what makes the report a WINDOW sum rather than a running
+            // total, without the reader ever resetting anything.
+            libUs[i] = (double)gPBIosShaderLibUs.exchange(0) / 1000.0;
+            libN[i] = gPBIosShaderLibN.exchange(0);
+            psoUs[i] = (double)gPBIosShaderPsoUs.exchange(0) / 1000.0;
+            psoN[i] = gPBIosShaderPsoN.exchange(0);
+            texUs[i] = (double)gPBIosTexUploadUs.exchange(0) / 1000.0;
+            texN[i] = gPBIosTexUploadN.exchange(0);
+            skipN[i] = gPBIosPassSkippedN.exchange(0);
+            copyN[i] = gPBIosCopyN.exchange(0);
+            copyPx[i] = (double)gPBIosCopyPx.exchange(0);
+            frameCount++;
+        }
+        lastPresent = now;
+    }
+
+    // Rev-2: called from the audio thread once per wake, after its produce and
+    // refill loops, i.e. with the reservoir in exactly the state the game
+    // thread will find when EndAudioFrame unblocks it.
+    void OnAudio(int buffered) {
+        std::lock_guard<std::mutex> lock(mutex);
+        audBuffered[audCount % kAudioRing] = buffered;
+        audCount++;
+    }
+
+    // Rev-2: the tick-phase marks, called from gfx_frame.c through
+    // PBIos_PerfTickPhase. All on the game thread, in order, once per frame.
+    void OnPhase(int phase) {
+        const Clock::time_point now = Clock::now();
+        switch (phase) {
+            case 0: // step_game_loop begin -- also the frame-to-frame mark
+                phasePendingLoopMs =
+                    phasePrevStart.time_since_epoch().count() == 0
+                        ? 0.0
+                        : std::chrono::duration<double, std::milli>(now - phasePrevStart).count();
+                phasePrevStart = now;
+                phaseTickT0 = now;
+                break;
+            case 1: // step_game_loop end
+                phasePendingTickMs =
+                    std::chrono::duration<double, std::milli>(now - phaseTickT0).count();
+                phaseTickEnd = now;
+                break;
+            case 2: // EndAudioFrame begin -- the display-list build ended here
+                phasePendingDlMs =
+                    std::chrono::duration<double, std::milli>(now - phaseTickEnd).count();
+                phaseAudT0 = now;
+                break;
+            case 3: { // EndAudioFrame end -- the frame's phase record is complete
+                const double waitMs =
+                    std::chrono::duration<double, std::milli>(now - phaseAudT0).count();
+                std::lock_guard<std::mutex> lock(mutex);
+                const int i = phaseCount % kPhaseRing;
+                phaseTickMs[i] = phasePendingTickMs;
+                phaseAudWaitMs[i] = waitMs;
+                phaseDlMs[i] = phasePendingDlMs;
+                phaseLoopMs[i] = phasePendingLoopMs;
+                phaseCount++;
+                break;
+            }
+            case 4: // this frame was held, not presented
+                holds.fetch_add(1);
+                break;
+            default:
+                break;
+        }
+    }
+
+    void OnTick() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            tickAt[tickCount % kTickRing] = Now();
+            tickCount++;
+        }
+        // Opt-in periodic log: a device run with nobody attached still leaves
+        // a trace in the app's stdout/log file.
+        static const bool logging = getenv("PAPERBOAT_PERF") != nullptr;
+        if (!logging) {
+            return;
+        }
+        const Clock::time_point now = Clock::now();
+        if (std::chrono::duration<double>(now - lastLog).count() < 5.0) {
+            return;
+        }
+        lastLog = now;
+        char line[1024];
+        if (Report(line, (int)sizeof(line)) > 0) {
+            SPDLOG_INFO("{}", line);
+        }
+    }
+
+    // REV 3 (round 16): the present period over the most recent ~1 s, which is
+    // what the interpolation target's auto-step-down reads (overlay 0023 rev 3).
+    // A WINDOW, not the whole ring: the ring is 8.5 s and a step-down decision
+    // made on 8.5 s of history would keep firing on data from before the last
+    // step. Returns the TOTAL present count (monotonic, so the caller can hold
+    // a cooldown against it); *p50Ms is 0 unless a full second of samples is in
+    // hand, which is also how warm-up is reported.
+    int PresentPeriod(double* p50Ms) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (p50Ms != nullptr) {
+            *p50Ms = 0.0;
+        }
+        const int n = frameCount < kFrameRing ? frameCount : kFrameRing;
+        if (n < 8) {
+            return frameCount;
+        }
+        double v[kFrameRing];
+        int m = 0;
+        double sum = 0.0;
+        for (int k = 1; k <= n && sum < 1000.0; k++) {
+            const int i = (frameCount - k) % kFrameRing;
+            v[m++] = wallMs[i];
+            sum += wallMs[i];
+        }
+        if (sum < 950.0 || m < 8) {
+            return frameCount; // less than a second of history: no verdict
+        }
+        std::sort(v, v + m);
+        if (p50Ms != nullptr) {
+            *p50Ms = v[m / 2];
+        }
+        return frameCount;
+    }
+
+    // REV 4 (round 17): the GAME's GPU price, p95 over the whole ring (~8.5 s).
+    // This is the input to overlay 0023 rev 4's step-UP: the target may only
+    // climb back when the frame has been comfortably inside the HIGHER target's
+    // period for a whole check window, and a p50 would let a frame in four sit
+    // over budget unnoticed. Returns 0 when the ring is too thin to judge or
+    // when nothing has priced a frame yet (the simulator's software GPU reads
+    // ~0.2 ms, so a sim step-up is always allowed - that is intended, it is how
+    // the policy is exercised without a ProMotion panel).
+    double GpuGameP95() {
+        std::lock_guard<std::mutex> lock(mutex);
+        const int n = frameCount < kFrameRing ? frameCount : kFrameRing;
+        if (n < 32) {
+            return 0.0;
+        }
+        double v[kFrameRing];
+        for (int i = 0; i < n; i++) {
+            v[i] = gpuGameMs[i];
+        }
+        std::sort(v, v + n);
+        return v[(int)(0.95 * (n - 1))];
+    }
+
+    // REV 6 (round 20): ONE WINDOW OF EVIDENCE, for overlay 0023 rev 5.
+    //
+    // Rev 4's step-down read the present PERIOD, which since rev 5's sub-frame
+    // skip is no longer a harm: a late present now costs an intermediate
+    // interpolated view, not game speed. What is still a harm is the TICK RATE
+    // falling, and the honest reading of that needs four things together over
+    // the same stretch of wall time - the tick rate, whether the skip is being
+    // asked to do more work (subskip), and whether anything in the window was a
+    // LOAD rather than a slow frame (a hold, or one enormous present or loop
+    // period). So they come out in one locked call instead of five, and every
+    // caller sees a consistent window.
+    //
+    //   windowMs      how far back to look (0023 uses 3000).
+    //   *tps          game ticks per wall second inside the window; 0 = fewer
+    //                 than two ticks in it, i.e. NO VERDICT (never "slow").
+    //   *presentMaxMs the largest present-to-present interval in the window.
+    //   *loopMaxMs    the largest game-loop period in the window.
+    //   *holds        cumulative held frames (0012 rev 2), like the perf line's.
+    //   *subSkips     cumulative skipped sub-frames (rev 5), same.
+    //   return        total presents, monotonic - the caller differences it to
+    //                 know how many presents its window actually contains.
+    int StepWindow(double windowMs, double* tps, double* presentMaxMs, double* loopMaxMs, unsigned int* holds_out,
+                   unsigned int* subSkips_out) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (tps != nullptr) {
+            *tps = 0.0;
+        }
+        if (presentMaxMs != nullptr) {
+            *presentMaxMs = 0.0;
+        }
+        if (loopMaxMs != nullptr) {
+            *loopMaxMs = 0.0;
+        }
+        if (holds_out != nullptr) {
+            *holds_out = holds.load();
+        }
+        if (subSkips_out != nullptr) {
+            *subSkips_out = subSkips.load();
+        }
+        if (windowMs <= 0.0) {
+            return frameCount;
+        }
+
+        // Presents, newest first, until the window is covered.
+        const int n = frameCount < kFrameRing ? frameCount : kFrameRing;
+        double sum = 0.0, pmax = 0.0;
+        for (int k = 1; k <= n && sum < windowMs; k++) {
+            const int i = (frameCount - k) % kFrameRing;
+            sum += wallMs[i];
+            pmax = std::max(pmax, wallMs[i]);
+        }
+        if (presentMaxMs != nullptr) {
+            *presentMaxMs = pmax;
+        }
+
+        // Game-loop periods over the same stretch (one per tick, ~33 ms each).
+        const int pn = phaseCount < kPhaseRing ? phaseCount : kPhaseRing;
+        double lsum = 0.0, lmax = 0.0;
+        for (int k = 1; k <= pn && lsum < windowMs; k++) {
+            const int i = (phaseCount - k) % kPhaseRing;
+            lsum += phaseLoopMs[i];
+            lmax = std::max(lmax, phaseLoopMs[i]);
+        }
+        if (loopMaxMs != nullptr) {
+            *loopMaxMs = lmax;
+        }
+
+        // Ticks inside the window: tickAt[] holds seconds since the probe's
+        // origin, so the window is a cutoff rather than a running sum.
+        const int tn = tickCount < kTickRing ? tickCount : kTickRing;
+        if (tn >= 2 && tps != nullptr) {
+            const double cutoff = Now() - windowMs / 1000.0;
+            double newest = 0.0, oldest = 0.0;
+            int cnt = 0;
+            for (int k = 1; k <= tn; k++) {
+                const double t = tickAt[(tickCount - k) % kTickRing];
+                if (t < cutoff) {
+                    break;
+                }
+                if (cnt == 0) {
+                    newest = t;
+                }
+                oldest = t;
+                cnt++;
+            }
+            if (cnt >= 2 && newest > oldest) {
+                *tps = (cnt - 1) / (newest - oldest);
+            }
+        }
+        return frameCount;
+    }
+
+    // Formats one report line. Returns its length, or 0 when there is not yet
+    // enough data. Safe from any thread.
+    int Report(char* out, int cap) {
+        std::lock_guard<std::mutex> lock(mutex);
+        const int n = frameCount < kFrameRing ? frameCount : kFrameRing;
+        if (out == nullptr || cap <= 0) {
+            return 0;
+        }
+        if (n < 8) {
+            return snprintf(out, (size_t)cap, "PB_PERF warming up (frames=%d ticks=%d thermal=%d)", frameCount,
+                            tickCount, PBIos_ThermalState());
+        }
+        double w[kFrameRing], e[kFrameRing], g[kFrameRing], gg[kFrameRing];
+        double wallSum = 0.0;
+        double libSum = 0.0, psoSum = 0.0, texSum = 0.0;
+        unsigned int libCount = 0, psoCount = 0, texCount = 0;
+        double skipSum = 0.0, copyCountSum = 0.0, copyPxSum = 0.0;
+        for (int i = 0; i < n; i++) {
+            w[i] = wallMs[i];
+            e[i] = engMs[i];
+            g[i] = gpuMs[i];
+            gg[i] = gpuGameMs[i];
+            wallSum += wallMs[i];
+            libSum += libUs[i];
+            libCount += libN[i];
+            psoSum += psoUs[i];
+            psoCount += psoN[i];
+            texSum += texUs[i];
+            texCount += texN[i];
+            skipSum += skipN[i];
+            copyCountSum += copyN[i];
+            copyPxSum += copyPx[i];
+        }
+        std::sort(w, w + n);
+        std::sort(e, e + n);
+        std::sort(g, g + n);
+        std::sort(gg, gg + n);
+        auto pct = [n](const double* v, double p) { return v[(int)(p * (n - 1))]; };
+
+        // fps over exactly the frames the percentiles describe.
+        const double fps = wallSum > 0.0 ? (n * 1000.0 / wallSum) : 0.0;
+
+        // tps from the tick ring: (samples - 1) intervals over their span.
+        double tps = 0.0;
+        const int tn = tickCount < kTickRing ? tickCount : kTickRing;
+        if (tn >= 2) {
+            const int oldest = tickCount < kTickRing ? 0 : (tickCount % kTickRing);
+            const int newest = (tickCount - 1) % kTickRing;
+            const double span = tickAt[newest] - tickAt[oldest];
+            if (span > 0.0) {
+                tps = (tn - 1) / span;
+            }
+        }
+        const double ipf = tps > 0.0 ? fps / tps : 0.0;
+
+        // Rev-2: the audio reservoir over its own ring. -1 means "no sample
+        // yet" and is printed as such rather than as a misleading 0.
+        double tickMax = 0.0, audWaitMax = 0.0, dlMax = 0.0, loopMax = 0.0;
+        const int pn = phaseCount < kPhaseRing ? phaseCount : kPhaseRing;
+        for (int i = 0; i < pn; i++) {
+            tickMax = std::max(tickMax, phaseTickMs[i]);
+            audWaitMax = std::max(audWaitMax, phaseAudWaitMs[i]);
+            dlMax = std::max(dlMax, phaseDlMs[i]);
+            loopMax = std::max(loopMax, phaseLoopMs[i]);
+        }
+
+        int audMin = -1, audMax = -1;
+        const int an = audCount < kAudioRing ? audCount : kAudioRing;
+        for (int i = 0; i < an; i++) {
+            const int v = audBuffered[i];
+            if (audMin < 0 || v < audMin) {
+                audMin = v;
+            }
+            if (v > audMax) {
+                audMax = v;
+            }
+        }
+
+        return snprintf(out, (size_t)cap,
+                        "PB_PERF wall_ms p50=%.2f p95=%.2f p99=%.2f max=%.2f | "
+                        "eng_ms p50=%.2f p95=%.2f max=%.2f | gpu_ms p50=%.2f p95=%.2f | "
+                        "gpu_game_ms p50=%.2f p95=%.2f max=%.2f | "
+                        "n=%d fps=%.1f tps=%.2f/%.0f ipf=%.2f thermal=%d msaa=%d | "
+                        "aud_min=%d aud_max=%d underruns=%u | "
+                        "lib_ms=%.1f lib_n=%u pso_ms=%.1f pso_n=%u | tex_up_n=%u tex_up_ms=%.1f | "
+                        "copy_n=%.2f copy_mpx=%.2f pass_skipped=%.2f | "
+                        "texcache ent=%u mb=%.1f budget_mb=%u evict=%llu | "
+                        "tick_max=%.1f dl_max=%.1f audwait_max=%.1f loop_max=%.1f holds=%u subskip=%u",
+                        pct(w, 0.5), pct(w, 0.95), pct(w, 0.99), w[n - 1], pct(e, 0.5), pct(e, 0.95), e[n - 1],
+                        pct(g, 0.5), pct(g, 0.95), pct(gg, 0.5), pct(gg, 0.95), gg[n - 1], n, fps, tps, kNativeTickHz, ipf, PBIos_ThermalState(),
+                        CVarGetInteger("gMSAAValue", 1), audMin,
+                        audMax, underruns.load(), libSum, libCount, psoSum, psoCount, texCount, texSum,
+                        copyCountSum / n, copyPxSum / n / 1.0e6, skipSum / n,
+                        gPBIosTexCacheEntries, (double)gPBIosTexCacheBytes / (1024.0 * 1024.0),
+                        gPBIosTexCacheBudgetMB, (unsigned long long)gPBIosTexCacheEvicts, tickMax, dlMax,
+                        audWaitMax, loopMax, holds.load(), subSkips.load());
+    }
+};
+
+static Probe gProbe;
+
+} // namespace PBIosPerf
+
+// ---------------------------------------------------------------------------
+// PAPERBOAT_IOS (overlay 0012 REV 5) — THE LATE SUB-FRAME SKIP.
+//
+// CLASS (b) — this block, and only this block, is an engine BEHAVIOUR change
+// worth sending upstream; everything else in overlay 0012 is class (a)
+// measurement. It lives in 0012 because it has to edit 0012's own hunk in
+// RunCommands, and apply-overlay.sh detects "already applied" by reverse-
+// applying at fuzz 0, so two patches cannot share those four lines.
+//
+// THE BUG. This engine expands ONE 30 Hz game tick into `target/30` presented
+// sub-frames and presents them back to back with no schedule of their own. A
+// present that misses its vsync slot therefore does not drop a frame — it
+// delays the NEXT TICK, because the tick cannot finish until its last
+// sub-frame has been presented. The game runs SLOW instead of choppy.
+// The user's 0.0.0.12 phone read, 2x SSAA on a 120 Hz panel, thermal 0:
+//
+//   wall_ms p50=8.33 p95=16.57 | fps=105.3 tps=26.49/30 ipf=3.98
+//
+// One slot lost in twenty (p95 = 16.57 ms = two slots) and the whole game runs
+// at 26.49/30 = 88 % speed — "smooth, but it dips to the 90s as I move".
+// Overlay 0023's step-down cannot help and must not fire: the median frame is
+// fine, so halving the target would make every frame worse to fix one in
+// twenty.
+//
+// THE FIX. Give the tick a SCHEDULE. Sub-frame `i` of a tick that started at
+// T is due at T + i * (tick period / sub-frame count). If, when we are about
+// to build and present sub-frame `i`, the clock is already past the END of
+// its slot, the frame is behind: drop that sub-frame entirely (it is never
+// built and never drawn) and move on. The LAST sub-frame of a tick is never
+// dropped — it is the key frame, interpolation factor 1.0, the true game
+// state — so what the player sees never lags the simulation; only the
+// intermediate interpolated views are thinned out. Tick cadence is preserved,
+// which is the whole point: `tps` goes back to 30.0 and the game plays at
+// full speed with a few fewer intermediate frames.
+//
+// WHY A RUNNING SCHEDULE AND NOT "time since RunCommands started". The tick's
+// budget covers the game logic, the audio join and the interpolation build as
+// well as the presents; anchoring at RunCommands would hand every tick a free
+// pass for whatever it spent before that. So T advances by exactly one tick
+// period per tick — a 30 Hz metronome — and resyncs to now only when the
+// engine is more than two tick periods off it in either direction (a map load,
+// a shader-compile burst, a resume from background). Without that resync a
+// genuine slowdown would skip every intermediate sub-frame forever instead of
+// settling.
+//
+// AUDIO IS NOT AFFECTED. The per-tick audio produce/join is
+// StartAudioFrame/EndAudioFrame inside Graphics_ThreadUpdate (see
+// docs/frame-map.md) — one per TICK, upstream of ProcessGfxCommands entirely.
+// Skipping a present cannot skip an audio frame; keeping the tick on cadence
+// is what keeps overlay 0026's reservoir fed.
+//
+// UPSTREAM HAS NO SUCH MECHANISM: SoH's Graph_ProcessGfxCommands
+// (soh/OTRGlobals.cpp:2180) and this port's ProcessGfxCommands are the same
+// loop, and neither times its sub-frames. There was no upstream shape to
+// borrow, so this one is written to be the smallest possible addition to it.
+//
+// TWO DIAGNOSTIC CVars, neither in the menu (class (a), see the design notes D30):
+//   gSohIos.SubFrameSkip           1 = on (default), 0 = the old behaviour.
+//                                  An A/B over the console bridge, no rebuild.
+//   gSohIos.DebugPresentDelayMs    sleep this many ms inside the present path,
+//   gSohIos.DebugPresentDelayEvery on every Nth present (default 20). This is
+//                                  how a fake slow GPU is produced on the
+//                                  simulator, whose GPU prices a frame at
+//                                  0.2 ms and can never miss a slot on its own.
+//   gSohIos.DebugPresentDelayOnceMs  REV 6: sleep this many ms in the NEXT
+//                                  present, once, then disarm. The one-shot
+//                                  stall - 21000 reproduces the launch-time
+//                                  21 s stall that stepped the user's 0.0.0.14
+//                                  down to 60 Hz (overlay 0023 rev 5).
+// ---------------------------------------------------------------------------
+namespace PBIosPace {
+
+using Clock = std::chrono::steady_clock;
+
+static Clock::time_point sTickStart{};
+static bool sHaveTickStart = false;
+static bool sEnabled = true;
+static double sSubPeriodMs = 1000.0 / 30.0;
+static int sDelayMs = 0;
+static int sDelayEvery = 20;
+static int sDelayOnceMs = 0; // rev 6: the one-shot stall, see BeginTick
+static unsigned long long sPresentN = 0;
+
+// Once per 30 Hz tick, from ProcessGfxCommands, before RunCommands.
+static void BeginTick(size_t subFrames, double tickPeriodMs) {
+    const Clock::time_point now = Clock::now();
+
+    if (!sHaveTickStart) {
+        sTickStart = now;
+        sHaveTickStart = true;
+    } else {
+        sTickStart += std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double, std::milli>(tickPeriodMs));
+        const double drift = std::chrono::duration<double, std::milli>(now - sTickStart).count();
+        if (drift > 2.0 * tickPeriodMs || drift < -2.0 * tickPeriodMs) {
+            // A map load, a shader burst, a resume: the metronome is no longer
+            // describing this run. Re-anchor rather than skip forever.
+            sTickStart = now;
+        }
+    }
+
+    sSubPeriodMs = subFrames > 0 ? tickPeriodMs / (double)subFrames : tickPeriodMs;
+    sEnabled = CVarGetInteger("gSohIos.SubFrameSkip", 1) != 0;
+    sDelayMs = CVarGetInteger("gSohIos.DebugPresentDelayMs", 0);
+    sDelayEvery = CVarGetInteger("gSohIos.DebugPresentDelayEvery", 20);
+    // REV 6: the ONE-SHOT stall. `gSohIos.DebugPresentDelayOnceMs` sleeps that
+    // many milliseconds in the NEXT present and then disarms itself, which is
+    // how a launch-time 21 s stall (the one that cost the user 120 Hz on
+    // 0.0.0.14 - loop_max 21139) is reproduced on the simulator without
+    // arming a repeating delay. The CVar is cleared here, not after the sleep,
+    // so a crash mid-stall cannot leave it armed in the saved config.
+    const int32_t pbOnce = CVarGetInteger("gSohIos.DebugPresentDelayOnceMs", 0);
+    if (pbOnce > 0) {
+        CVarSetInteger("gSohIos.DebugPresentDelayOnceMs", 0);
+        sDelayOnceMs = pbOnce;
+    }
+}
+
+// True when sub-frame `i` of `n` is already past the end of its slot. Never
+// true for the last sub-frame of a tick, and never for an un-interpolated tick.
+static bool ShouldSkip(size_t i, size_t n) {
+    if (!sEnabled || !sHaveTickStart || n < 2 || i + 1 >= n) {
+        return false;
+    }
+    const double elapsedMs = std::chrono::duration<double, std::milli>(Clock::now() - sTickStart).count();
+    if (elapsedMs < (double)(i + 1) * sSubPeriodMs) {
+        return false;
+    }
+    PBIosPerf::gProbe.subSkips.fetch_add(1);
+    return true;
+}
+
+// The fake-slow-GPU hook, inside the measured present so eng_ms sees it too.
+static void DebugPresentDelay() {
+    sPresentN++;
+    if (sDelayOnceMs > 0) {
+        const int pbOnce = sDelayOnceMs;
+        sDelayOnceMs = 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(pbOnce));
+    }
+    if (sDelayMs <= 0) {
+        return;
+    }
+    const unsigned long long every = sDelayEvery > 0 ? (unsigned long long)sDelayEvery : 1ull;
+    if (sPresentN % every != 0) {
+        return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(sDelayMs));
+}
+
+} // namespace PBIosPace
+
+// The console bridge's `fps` verb (app/ios/PaperBoatIosShell.m ->
+// docs/console-bridge.md). Returns the length written.
+extern "C" int PBIos_PerfReport(char* out, int cap) {
+    return PBIosPerf::gProbe.Report(out, cap);
+}
+
+// REV 7 (round 22): the bridge's `texcache` verb. The same four numbers the
+// `fps` line carries, alone on a line, because the question the HD pack asks
+// ("how much GPU memory are textures holding, and is the budget evicting?") is
+// asked repeatedly while a scene loads and the rest of the perf line is noise
+// there. Overlay 0037 owns the counters.
+extern "C" int PBIos_TexCacheReport(char* out, int cap) {
+    return snprintf(out, (size_t)cap, "entries=%u bytes=%llu mb=%.2f budget_mb=%u evictions=%llu",
+                    gPBIosTexCacheEntries, (unsigned long long)gPBIosTexCacheBytes,
+                    (double)gPBIosTexCacheBytes / (1024.0 * 1024.0), gPBIosTexCacheBudgetMB,
+                    (unsigned long long)gPBIosTexCacheEvicts);
+}
+
+// REV 3 (round 16): read by GetInterpolationFPS()'s auto-step-down (overlay
+// 0023 rev 3) and by the bridge's `refresh` verb. Returns the total present
+// count; *p50Ms is the median present period over the last ~1 s, or 0 when
+// there is not yet a second of history.
+extern "C" int PBIos_PerfPresentPeriod(double* p50Ms) {
+    return PBIosPerf::gProbe.PresentPeriod(p50Ms);
+}
+
+// REV 4 (round 17): read by GetInterpolationFPS()'s step-UP (overlay 0023
+// rev 4). gpu_game_ms p95 over the ring, in milliseconds; 0 = no verdict.
+extern "C" double PBIos_PerfGpuGameP95(void) {
+    return PBIosPerf::gProbe.GpuGameP95();
+}
+
+// REV 6 (round 20): read by GetInterpolationFPS()'s step policy (overlay 0023
+// rev 5). One locked window of evidence - tick rate, the cumulative hold and
+// sub-frame-skip counters, and the largest present and loop period in it, so a
+// window containing a LOAD can be told apart from a window of slow frames.
+// Returns the total present count. See Probe::StepWindow.
+extern "C" int PBIos_PerfStepWindow(double windowMs, double* tps, double* presentMaxMs, double* loopMaxMs,
+                                    unsigned int* holds, unsigned int* subSkips) {
+    return PBIosPerf::gProbe.StepWindow(windowMs, tps, presentMaxMs, loopMaxMs, holds, subSkips);
+}
+
+// Rev-2. Called from the audio thread (declared above HandleAudioThread by this
+// same patch): the reservoir sample, and the underrun tally that overlay 0026
+// feeds once it rate-limits the log line.
+extern "C" void PBIos_PerfNoteAudioBuffered(int samples) {
+    PBIosPerf::gProbe.OnAudio(samples);
+}
+
+extern "C" void PBIos_PerfNoteUnderrun(void) {
+    PBIosPerf::gProbe.underruns.fetch_add(1);
+}
+
+// Rev-2. Called from src/port/gfx_frame.c (plain C, so the clocks stay here):
+//   0 step_game_loop begin   1 step_game_loop end
+//   2 EndAudioFrame begin    3 EndAudioFrame end
+//   4 this frame was HELD (GLOBAL_OVERRIDES_DISABLE_DRAW_FRAME), not presented
+extern "C" void PBIos_PerfTickPhase(int phase) {
+    PBIosPerf::gProbe.OnPhase(phase);
+}
+#endif // __IOS__
+
+'''
+
+ENGINE_PROBE_OLD = """void GameEngine::RunCommands(Gfx* Commands, const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements) {
+"""
+ENGINE_PROBE_NEW = PROBE + ENGINE_PROBE_OLD
+
+ENGINE_FRAME_OLD = """    for (const auto& m : mtx_replacements) {
+        wnd->DrawAndRunGraphicsCommands(Commands, m, {});
+        interpreter->mInterpolationIndex++;
+    }
+"""
+ENGINE_FRAME_NEW = """#ifdef __IOS__
+    // PAPERBOAT_IOS (overlay 0012 rev 5): the sub-frame schedule, armed by
+    // BeginTick above. See PBIosPace for why a late present must drop a
+    // sub-frame instead of delaying the next tick.
+    const size_t pbSubCount = mtx_replacements.size();
+    size_t pbSubIndex = 0;
+#endif
+    for (const auto& m : mtx_replacements) {
+#ifdef __IOS__
+        if (PBIosPace::ShouldSkip(pbSubIndex, pbSubCount)) {
+            // Never built, never drawn, never presented — the whole saving.
+            pbSubIndex++;
+            interpreter->mInterpolationIndex++;
+            continue;
+        }
+        pbSubIndex++;
+        // PAPERBOAT_IOS_PERF (overlay 0012): one present per iteration.
+        const auto pbPerfT0 = std::chrono::steady_clock::now();
+#endif
+        wnd->DrawAndRunGraphicsCommands(Commands, m, {});
+#ifdef __IOS__
+        PBIosPace::DebugPresentDelay();
+        PBIosPerf::gProbe.OnFrame(
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pbPerfT0).count());
+#endif
+        interpreter->mInterpolationIndex++;
+    }
+"""
+
+ENGINE_TICK_OLD = """    RunCommands(commands, mtx_replacements);
+
+    last_fps = fps;
+"""
+ENGINE_TICK_NEW = """#ifdef __IOS__
+    // PAPERBOAT_IOS (overlay 0012 rev 5): arm this tick's sub-frame schedule.
+    // `original_fps` is PM64's native 30, so the tick period is 33.33 ms
+    // whatever the interpolation target is; the sub-frame period is that over
+    // the number of sub-frames this tick produced.
+    PBIosPace::BeginTick(mtx_replacements.size(), 1000.0 / (double)original_fps);
+#endif
+    RunCommands(commands, mtx_replacements);
+#ifdef __IOS__
+    // PAPERBOAT_IOS_PERF (overlay 0012): one ProcessGfxCommands call is one
+    // 30 Hz game tick — the sim-rate metric's numerator.
+    PBIosPerf::gProbe.OnTick();
+#endif
+
+    last_fps = fps;
+"""
+
+# Rev-2: the audio thread's two hooks. The probe itself is defined further down
+# the file (just above RunCommands), so the declarations have to be planted here
+# — and planting them here is also what lets overlay 0026 call
+# PBIos_PerfNoteUnderrun from inside produceFrame without declaring it again.
+ENGINE_AUDIODECL_OLD = """// Audio
+
+void GameEngine::HandleAudioThread() {
+"""
+ENGINE_AUDIODECL_NEW = """// Audio
+
+#ifdef __IOS__
+// PAPERBOAT_IOS_PERF (overlay 0012 rev2): the audio half of the harness. Both
+// are defined with the probe below (C ABI, so the declaration is enough here).
+// The reservoir sample answers "how close to empty was the queue when the game
+// thread unblocked"; the underrun tally is fed by overlay 0026, which
+// rate-limits the log line that used to be the only evidence.
+extern "C" void PBIos_PerfNoteAudioBuffered(int samples);
+extern "C" void PBIos_PerfNoteUnderrun(void);
+#endif
+
+void GameEngine::HandleAudioThread() {
+"""
+
+ENGINE_AUDIOSAMPLE_OLD = """            produceFrame();
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(mAudio.mutex);
+            mAudio.processing = false;
+        }
+"""
+ENGINE_AUDIOSAMPLE_NEW = """            produceFrame();
+        }
+
+#ifdef __IOS__
+        // PAPERBOAT_IOS_PERF (overlay 0012 rev2): sample the reservoir HERE —
+        // after produce and refill, before `processing` clears — because this
+        // is exactly the state EndAudioFrame hands back to the game thread.
+        // Feeds aud_min / aud_max.
+        PBIos_PerfNoteAudioBuffered(AudioPlayerBuffered());
+#endif
+
+        {
+            std::unique_lock<std::mutex> lock(mAudio.mutex);
+            mAudio.processing = false;
+        }
+"""
+
+EDITS.append(("src/port/Engine.cpp", [(ENGINE_PROBE_OLD, ENGINE_PROBE_NEW, 1),
+                                      (ENGINE_FRAME_OLD, ENGINE_FRAME_NEW, 1),
+                                      (ENGINE_TICK_OLD, ENGINE_TICK_NEW, 1),
+                                      (ENGINE_AUDIODECL_OLD, ENGINE_AUDIODECL_NEW, 1),
+                                      (ENGINE_AUDIOSAMPLE_OLD, ENGINE_AUDIOSAMPLE_NEW, 1)]))
+
+# ------------------------------------------- external/libultraship/.../gfx_metal.cpp
+METAL_DECL_OLD = """#include <spdlog/spdlog.h>
+#include <spdlog/fmt/fmt.h>
+
+#include "fast/backends/gfx_metal_shader.h"
+"""
+METAL_DECL_NEW = """#include <spdlog/spdlog.h>
+#include <spdlog/fmt/fmt.h>
+
+#ifdef __IOS__
+// PAPERBOAT_IOS (overlay 0012): true GPU frame time for the perf harness.
+// Defined here, next to the only writer; read by the probe in
+// src/port/Engine.cpp. C linkage and file scope — a linkage specification
+// cannot sit inside a function body in C++.
+//
+// Rev-2 adds three more ledgers on the same principle — the writer owns the
+// storage. They are cumulative micros/counts; the probe's present hook drains
+// them with exchange(0) into its frame ring, which is what keeps `fps`
+// idempotent (D15: no reset-on-read by the READER).
+#include <atomic>
+#include <chrono>
+extern "C" {
+volatile float gPBIosGpuMs = 0.0f;
+// Rev-3 (round 16): the GAME framebuffer's GPU time. gPBIosGpuMs above is the
+// SCREEN framebuffer only — and on this fork that buffer holds nothing but the
+// ImGui composite plus the presentDrawable, so it can neither see the 5472x2520
+// game pass nor be separated from the present wait. Every non-zero framebuffer
+// gets its own command buffer (StartDrawToFramebuffer), so this is the sum of
+// their GPU durations, in micros, drained per present by the probe.
+std::atomic<uint64_t> gPBIosGpuGameUs{ 0 };
+std::atomic<uint64_t> gPBIosShaderLibUs{ 0 };
+std::atomic<uint32_t> gPBIosShaderLibN{ 0 };
+std::atomic<uint64_t> gPBIosShaderPsoUs{ 0 };
+std::atomic<uint32_t> gPBIosShaderPsoN{ 0 };
+std::atomic<uint64_t> gPBIosTexUploadUs{ 0 };
+std::atomic<uint32_t> gPBIosTexUploadN{ 0 };
+// Rev-4 (round 17): the render-pass ledger. `gPBIosPassSkippedN` counts render
+// passes that were NEVER ENCODED because nothing would have drawn into them
+// (overlay 0033 owes the encoder instead of opening it eagerly, and counts the
+// ones still owed when the frame ends); `gPBIosCopyN` / `gPBIosCopyPx` count the
+// full-screen framebuffer copies PM64 emits every frame and the pixels they
+// move. Both are written by overlay 0033 and defined HERE so that patch can be
+// dropped without taking the perf line's fields with it - they simply read 0.
+std::atomic<uint32_t> gPBIosPassSkippedN{ 0 };
+std::atomic<uint32_t> gPBIosCopyN{ 0 };
+std::atomic<uint64_t> gPBIosCopyPx{ 0 };
+}
+#endif
+
+#include "fast/backends/gfx_metal_shader.h"
+"""
+
+METAL_PROBE_OLD = """    mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
+    screen_framebuffer.mCommandBuffer->commit();
+"""
+METAL_PROBE_NEW = """    mCurrentVertexBufferPoolIndex = (mCurrentVertexBufferPoolIndex + 1) % kMaxVertexBufferPoolSize;
+#ifdef __IOS__
+    // PAPERBOAT_IOS (overlay 0012): the screen pass's real GPU duration. The
+    // harness's eng_ms includes present blocking and so cannot tell a
+    // saturated GPU from an idle one waiting on the compositor; this can.
+    // Registered before commit(), as Metal requires. Last sample wins — the
+    // reader takes percentiles over hundreds of frames, so a frame of lag is
+    // immaterial. The sanity window rejects the zeroes a never-scheduled
+    // buffer reports.
+    screen_framebuffer.mCommandBuffer->addCompletedHandler(MTL::HandlerFunction([](MTL::CommandBuffer* cb) {
+        const double ms = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+        if (ms > 0.0 && ms < 1000.0) {
+            gPBIosGpuMs = (float)ms;
+        }
+    }));
+#endif
+    screen_framebuffer.mCommandBuffer->commit();
+"""
+
+# Rev-3 (round 16): the GAME framebuffer's GPU time. Same handler, on the OTHER
+# command buffers — the ones EndFrame commits in its while loop, which are where
+# the supersampled game pass and PM64's per-frame framebuffer copy actually run.
+METAL_GAMEGPU_OLD = """        if (!framebuffer.mHasEndedEncoding)
+            framebuffer.mCommandEncoder->endEncoding();
+
+        framebuffer.mCommandBuffer->commit();
+        it++;
+"""
+METAL_GAMEGPU_NEW = """        if (!framebuffer.mHasEndedEncoding)
+            framebuffer.mCommandEncoder->endEncoding();
+
+#ifdef __IOS__
+        // PAPERBOAT_IOS (overlay 0012 rev3): gpu_game_ms. THIS is where the
+        // game is actually rendered — at mCurDimensions, i.e. 5472x2520 at 2x
+        // supersampling — and none of it was ever in gpu_ms, which samples only
+        // framebuffer 0 (the ImGui composite plus presentDrawable). Summed
+        // across every non-screen buffer of the frame and drained per present.
+        framebuffer.mCommandBuffer->addCompletedHandler(MTL::HandlerFunction([](MTL::CommandBuffer* cb) {
+            const double ms = (cb->GPUEndTime() - cb->GPUStartTime()) * 1000.0;
+            if (ms > 0.0 && ms < 1000.0) {
+                gPBIosGpuGameUs.fetch_add((uint64_t)(ms * 1000.0));
+            }
+        }));
+#endif
+        framebuffer.mCommandBuffer->commit();
+        it++;
+"""
+
+# Rev-2: the texture-upload ledger. Hooked in UploadTexture (the RGBA32 path the
+# count-keyed LRU re-runs after every eviction — docs/lus-divergence.md row 0020,
+# hypothesis H3). The mip path is left alone: it is one call per level and would
+# double-count a single logical upload.
+METAL_TEXUP_OLD = """void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) {
+        return;
+    }
+"""
+METAL_TEXUP_NEW = """void GfxRenderingAPIMetal::UploadTexture(const uint8_t* rgba32_buf, uint32_t width, uint32_t height) {
+    if (width == 0 || height == 0) {
+        return;
+    }
+#ifdef __IOS__
+    // PAPERBOAT_IOS (overlay 0012 rev2): tex_up_n / tex_up_ms.
+    const auto pbTexT0 = std::chrono::steady_clock::now();
+#endif
+"""
+
+METAL_TEXUPEND_OLD = """    texture->replaceRegion(region, 0, rgba32_buf, bytes_per_row);
+    texture_data->texture = texture;
+    texture_data->mip_levels = 1;
+    texture_data->auto_mipmaps = false;
+
+    autorelease_pool->release();
+}
+"""
+METAL_TEXUPEND_NEW = """    texture->replaceRegion(region, 0, rgba32_buf, bytes_per_row);
+    texture_data->texture = texture;
+    texture_data->mip_levels = 1;
+    texture_data->auto_mipmaps = false;
+
+    autorelease_pool->release();
+#ifdef __IOS__
+    gPBIosTexUploadUs.fetch_add(
+        (uint64_t)std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - pbTexT0).count());
+    gPBIosTexUploadN.fetch_add(1);
+#endif
+}
+"""
+
+EDITS.append((f"{LUS}/src/fast/backends/gfx_metal.cpp",
+              [(METAL_DECL_OLD, METAL_DECL_NEW, 1), (METAL_PROBE_OLD, METAL_PROBE_NEW, 1),
+               (METAL_GAMEGPU_OLD, METAL_GAMEGPU_NEW, 1),
+               (METAL_TEXUP_OLD, METAL_TEXUP_NEW, 1), (METAL_TEXUPEND_OLD, METAL_TEXUPEND_NEW, 1)]))
+
+# ------------------------------------------------------- src/port/gfx_frame.c
+# Rev-2: the tick-phase split. One extern, five marks, no clock arithmetic in
+# the C file. Nothing else in the overlay touches gfx_frame.c.
+FRAME_DECL_OLD = """// C++ bridge function - defined in Game.cpp
+extern void Graphics_PushFrame(Gfx* displayList);
+"""
+FRAME_DECL_NEW = """// C++ bridge function - defined in Game.cpp
+extern void Graphics_PushFrame(Gfx* displayList);
+
+#ifdef __IOS__
+// PAPERBOAT_IOS_PERF (overlay 0012 rev2): the tick-phase split. Defined in
+// src/port/Engine.cpp; see the probe there for what each phase number means.
+// This exists because the present-path hooks cannot see a frame that was never
+// presented, and the hold path below is exactly that frame.
+extern void PBIos_PerfTickPhase(int phase);
+#endif
+"""
+
+FRAME_TICK_OLD = """    // Run game logic
+    FrameInterpolation_RecordOpenChild("game_logic", 0);
+    step_game_loop();
+    FrameInterpolation_RecordCloseChild();
+"""
+FRAME_TICK_NEW = """    // Run game logic
+    FrameInterpolation_RecordOpenChild("game_logic", 0);
+#ifdef __IOS__
+    PBIos_PerfTickPhase(0);
+#endif
+    step_game_loop();
+#ifdef __IOS__
+    PBIos_PerfTickPhase(1);
+#endif
+    FrameInterpolation_RecordCloseChild();
+"""
+
+FRAME_AUDIO_OLD = """    // Wait for audio frame to complete
+    GameEngine_EndAudioFrame();
+"""
+FRAME_AUDIO_NEW = """    // Wait for audio frame to complete
+#ifdef __IOS__
+    PBIos_PerfTickPhase(2);
+#endif
+    GameEngine_EndAudioFrame();
+#ifdef __IOS__
+    PBIos_PerfTickPhase(3);
+#endif
+"""
+
+FRAME_HOLD_OLD = """    if (gOverrideFlags & GLOBAL_OVERRIDES_DISABLE_DRAW_FRAME) {
+        GameEngine_HoldFrame();
+        return;
+    }
+"""
+FRAME_HOLD_NEW = """    if (gOverrideFlags & GLOBAL_OVERRIDES_DISABLE_DRAW_FRAME) {
+#ifdef __IOS__
+        // A held frame never reaches ProcessGfxCommands, so wall_ms and tps
+        // both blame the renderer for it. Count it instead.
+        PBIos_PerfTickPhase(4);
+#endif
+        GameEngine_HoldFrame();
+        return;
+    }
+"""
+
+EDITS.append(("src/port/gfx_frame.c", [(FRAME_DECL_OLD, FRAME_DECL_NEW, 1),
+                                       (FRAME_TICK_OLD, FRAME_TICK_NEW, 1),
+                                       (FRAME_AUDIO_OLD, FRAME_AUDIO_NEW, 1),
+                                       (FRAME_HOLD_OLD, FRAME_HOLD_NEW, 1)]))
+
+chunks = []
+for rel, subs in EDITS:
+    src = VENDOR / rel
+    orig = src.read_text()
+    text = orig
+    for old, new, expect in subs:
+        n = text.count(old)
+        assert n == expect, f"{rel}: expected {expect} match(es) of {old!r:.70}, got {n}"
+        text = text.replace(old, new, 1)
+    with tempfile.NamedTemporaryFile("w", suffix=".a", delete=False) as fa, \
+         tempfile.NamedTemporaryFile("w", suffix=".b", delete=False) as fb:
+        fa.write(orig); fb.write(text); fa.flush(); fb.flush()
+        r = subprocess.run(["diff", "-u", "--label", f"a/{rel}", "--label", f"b/{rel}",
+                            fa.name, fb.name], capture_output=True)
+    assert r.returncode == 1, f"{rel}: diff produced no change"
+    chunks.append(r.stdout.decode())
+
+OUT.write_text(__doc__ + "\n" + "".join(chunks))
+print(f"wrote {OUT}")
