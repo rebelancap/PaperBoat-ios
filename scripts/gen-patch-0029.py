@@ -77,6 +77,32 @@ Two hunks in `src/cam_main.c`, which no other patch in the series touches:
 `render_frame`'s scissor block (~:229).
 
 Match-count asserted against the pristine vendor state.
+
+REV 2 - THE PROJECTION HAS TO AGREE WITH THE VIEWPORT
+-----------------------------------------------------
+Rev 1 filled the viewport to all 240 rows but left the projection alone, and
+`update_cameras` still builds it with `aspect = viewportW / viewportH` =
+296/200 for CAM_DEFAULT/CAM_BATTLE. LUS then scales clip-x by
+`(4/3) / screen_aspect`, so the aspect the world is actually drawn at is the
+viewport's - 320/240 once rev 1 fills the height - while the matrix says
+296/200. w/h therefore came out at 0.90 of correct: shipped 1.0.0 drew the 3D
+world about 10 % TOO TALL. (Pristine upstream, with the 200-tall viewport, is
+the other way: about 8 % too wide.)
+
+Rev 2 adds two more hunks to the same file: a forward declaration of the
+existing static `cam_view_is_widened()` near the top (it is defined below
+`update_cameras`), and, in the `!(cam->flags & CAMERA_FLAG_ORTHO)` branch, an
+aspect computed as `SCREEN_WIDTH / h` for a widened CAM_DEFAULT/CAM_BATTLE
+view, where `h` is `SCREEN_HEIGHT` when the camera passes the SAME full-height
+test rev 1's viewport hunk uses (`viewportH >= SCREEN_HEIGHT - 2 *
+SCREEN_INSET_Y`) and the camera's own `viewportH` otherwise. The two hunks
+therefore agree by construction: whenever rev 1 stretches the viewport to 240,
+the projection says 320/240.
+
+This is the same rule as upstream's open PR #183 (`cam_get_display_aspect`
+returning `SCREEN_WIDTH / viewportH` for CAM_DEFAULT/CAM_BATTLE in a widened
+view, with its Full Height View making `viewportH` 240). Class is unchanged:
+(b), an upstream bug fix, not iOS-gated.
 """
 import subprocess, pathlib, tempfile
 
@@ -151,8 +177,46 @@ NEW_SCISSOR = """            get_cam_scissor_x(camID, &ulx, &lrx);
             }
 """
 
+OLD_FWD = """void render_models(void);
+void execute_render_tasks(void);
+void render_item_entities(void);
+"""
+
+NEW_FWD = """void render_models(void);
+void execute_render_tasks(void);
+void render_item_entities(void);
+
+// PAPERBOAT (overlay 0029 rev 2): defined below update_cameras, which needs it
+// for the widescreen projection aspect.
+static b32 cam_view_is_widened(void);
+"""
+
+OLD_PERSP = """            guPerspectiveF(cam->mtxPerspective, &cam->perspNorm, cam->vfov, (f32) cam->viewportW / (f32) cam->viewportH, (f32) cam->nearClip, (f32) cam->farClip, 1.0f);
+"""
+
+NEW_PERSP = """            f32 aspect = (f32) cam->viewportW / (f32) cam->viewportH;
+
+            // PAPERBOAT (overlay 0029 rev 2): in a widened view the
+            // CAM_DEFAULT/CAM_BATTLE viewport is 320 native units wide
+            // (cam_widescreen_fit_viewport), and 240 tall when the rev-1 hunk
+            // fills the height; the projection must say so or LUS's
+            // (4/3)/aspect clip-x scale stretches the world (rev 1: 10% too
+            // tall; pristine upstream: 8% too wide). Same rule as upstream
+            // PR #183's cam_get_display_aspect. The full-height test is
+            // character-for-character the one the rev-1 viewport hunk uses, so
+            // the two cannot disagree.
+            if (cam_view_is_widened() && (camID == CAM_DEFAULT || camID == CAM_BATTLE)) {
+                f32 h = (cam->viewportH >= SCREEN_HEIGHT - 2 * SCREEN_INSET_Y) ? (f32) SCREEN_HEIGHT : (f32) cam->viewportH;
+                aspect = (f32) SCREEN_WIDTH / h;
+            }
+
+            guPerspectiveF(cam->mtxPerspective, &cam->perspNorm, cam->vfov, aspect, (f32) cam->nearClip, (f32) cam->farClip, 1.0f);
+"""
+
 text = replace_once(orig, OLD_FIT, NEW_FIT, "cam_widescreen_fit_viewport CAM_DEFAULT branch")
 text = replace_once(text, OLD_SCISSOR, NEW_SCISSOR, "render_frame scissor")
+text = replace_once(text, OLD_FWD, NEW_FWD, "cam_view_is_widened forward declaration")
+text = replace_once(text, OLD_PERSP, NEW_PERSP, "update_cameras guPerspectiveF aspect")
 
 with tempfile.NamedTemporaryFile("w", suffix=".a", delete=False) as fa, \
      tempfile.NamedTemporaryFile("w", suffix=".b", delete=False) as fb:

@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Overlay patch 0038 - a transient audio-device failure must never become
+permanent silence.
+
+CLASS: (b) upstream bug fix worth sending to JeodC/libultraship (kept as a
+clean, sendable patch per the repo's patch-class rule; no PR is planned - see
+MEMORY "no upstream PRs"). Parts 2 and 3 are iOS-gated; part 1 is not, because
+the bug it fixes is a config-poisoning bug on every platform.
+
+THE BUG
+-------
+From the user's phone log, 2026-09-17: one launch hit a TRANSIENT
+`SDL_OpenAudioDevice` failure -
+
+    Could not activate Audio Session ... Session activation failed
+    (external/libultraship/src/ship/audio/SDLAudioPlayer.cpp:42)
+
+iOS refuses to activate an audio session when another app owns it in an
+exclusive mode, during a call, or for a moment right after a cold launch. The
+failure is momentary. `Ship::Audio::InitAudioPlayer` reacted to it by calling
+
+    SetCurrentAudioBackend(AudioBackend::NUL);
+
+and `SetCurrentAudioBackend` does TWO things: it swaps the player, and it
+WRITES `"Window.AudioBackend": "null"` into the user's config and `Save()`s it.
+So the momentary failure was persisted. Every launch since read `"null"` back
+out of the config, selected the null player deliberately, never even tried to
+open a device - and the log has carried no "SDL Audio initialized" line since.
+One transient failure, permanent silence, with no way back short of deleting
+the config: there is no audio-backend picker in this port's menu.
+
+THE FIX, IN THREE PARTS
+-----------------------
+1. `InitAudioPlayer`: on an Init() failure, fall back WITHOUT PERSISTING.
+   `mAudioBackend` is left exactly as it was (so the next launch retries the
+   real backend, and the next `SetCurrentAudioBackend` call still does the
+   right thing) and only `mAudioPlayer` is swapped for a `NullAudioPlayer` for
+   the remainder of this run. Nothing is written to the config. This is the
+   part that stops a new config from being poisoned.
+
+2. `GetSavedAudioBackend`, `#ifdef __IOS__`: a saved `"null"` is treated as
+   `SDL`. The null backend is never a user's choice on a phone - this port
+   exposes no backend picker, so the ONLY way "null" can reach the config is
+   the bug above - and this is the self-heal for the configs already poisoned
+   (the user's among them). It overrides the READ and deliberately does NOT
+   rewrite the config, which is the pattern this repo already settled on in
+   overlay 0028: a changed default never beats a saved value, so the read site
+   is where an upstream value has to be overridden, and the user's config is
+   not ours to rewrite.
+
+3. `SDLAudioPlayer::DoInit`, `#ifdef __IOS__`: retry `SDL_OpenAudioDevice` up
+   to 5 times with a 200 ms delay between attempts, logging each failure with
+   its attempt number, before giving up. A session that is busy at t=0 is
+   usually free well inside a second, so with parts 1 and 2 behind it this is
+   what turns the failure into a shrug instead of a silent launch. The
+   non-iOS path is byte-for-byte unchanged (the whole retry loop is inside the
+   ifdef).
+
+HUNK HYGIENE
+------------
+`apply-overlay.sh` detects "already applied" by reverse-applying at fuzz=0, so
+two patches sharing context lines break on the SECOND build. Checked: no other
+patch in the series touches `ship/audio/Audio.cpp` or
+`ship/audio/SDLAudioPlayer.cpp` at all - the audio work in 0026 (the reservoir)
+and 0012 (the perf harness) lives in `src/port/Engine.cpp`. The two Audio.cpp
+hunks here are ~55 lines apart, far clear of each other.
+"""
+import subprocess, pathlib, tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+VENDOR = ROOT / "vendor/PaperBoat"
+OUT = ROOT / "overlay/patches/0038-lus-ios-audio-never-persist-null.patch"
+
+EDITS = []  # (relative path, old, new, expected count)
+
+# ---------------------------------------------------------------------------
+# 1. InitAudioPlayer: fall back for THIS RUN, never persist.
+# ---------------------------------------------------------------------------
+EDITS.append((
+    "external/libultraship/src/ship/audio/Audio.cpp",
+    """    if (mAudioPlayer && !mAudioPlayer->Init()) {
+        // Failed to initialize system audio player.
+        // Fallback to Null if the native system player does not work.
+        SetCurrentAudioBackend(AudioBackend::NUL);
+    }
+}
+""",
+    """    if (mAudioPlayer && !mAudioPlayer->Init()) {
+        // OVERLAY 0038: this used to call SetCurrentAudioBackend(NUL), which
+        // WRITES "Window.AudioBackend": "null" into the user's config and
+        // saves it. A device failure is usually transient (on iOS: another app
+        // holding the session, a call, a cold-launch race), so persisting it
+        // turned one bad launch into permanent silence for every launch after.
+        // Fall back for THIS RUN only: mAudioBackend keeps its real value so
+        // the next launch retries, and nothing is saved.
+        SPDLOG_ERROR("audio: {} backend failed to init; using null output for this run only (not saved)",
+                     PbAudioBackendName(GetCurrentAudioBackend()));
+        mAudioPlayer = std::make_shared<NullAudioPlayer>(this->mAudioSettings);
+        mAudioPlayer->Init();
+    }
+}
+""",
+    1,
+))
+
+# The name helper, defined just above InitAudioPlayer.
+EDITS.append((
+    "external/libultraship/src/ship/audio/Audio.cpp",
+    """void Audio::InitAudioPlayer() {
+""",
+    """// OVERLAY 0038: a backend's name for the log line below. Deliberately not
+// reusing SetCurrentAudioBackend's switch, which exists to WRITE the config.
+static const char* PbAudioBackendName(AudioBackend backend) {
+    switch (backend) {
+        case AudioBackend::WASAPI:
+            return "wasapi";
+        case AudioBackend::COREAUDIO:
+            return "coreaudio";
+        case AudioBackend::SDL:
+            return "sdl";
+        case AudioBackend::NUL:
+            return "null";
+        default:
+            return "unknown";
+    }
+}
+
+void Audio::InitAudioPlayer() {
+""",
+    1,
+))
+
+# ---------------------------------------------------------------------------
+# 2. GetSavedAudioBackend: self-heal a config already poisoned with "null".
+# ---------------------------------------------------------------------------
+EDITS.append((
+    "external/libultraship/src/ship/audio/Audio.cpp",
+    """    if (backendName == "null") {
+        return AudioBackend::NUL;
+    }
+""",
+    """    if (backendName == "null") {
+#ifdef __IOS__
+        // OVERLAY 0038: the self-heal. This port ships no audio-backend picker,
+        // so "null" in a phone's config is never a user's choice - it is the
+        // persisted transient failure fixed above, and it silences every launch
+        // from then on. Override the READ (overlay 0028's pattern) and leave
+        // the user's config alone; if the device genuinely cannot be opened,
+        // InitAudioPlayer's non-persisting fallback handles it again this run.
+        static bool pbWarned = false;
+        if (!pbWarned) {
+            pbWarned = true;
+            SPDLOG_WARN("audio: saved backend 'null' ignored on iOS; using sdl");
+        }
+        return AudioBackend::SDL;
+#else
+        return AudioBackend::NUL;
+#endif
+    }
+""",
+    1,
+))
+
+# ---------------------------------------------------------------------------
+# 3. SDLAudioPlayer::DoInit: retry the open on iOS before giving up.
+# ---------------------------------------------------------------------------
+EDITS.append((
+    "external/libultraship/src/ship/audio/SDLAudioPlayer.cpp",
+    """    mDevice = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (mDevice == 0) {
+        SPDLOG_ERROR("SDL_OpenAudio error: {}", SDL_GetError());
+        return false;
+    }
+""",
+    """#ifdef __IOS__
+    // OVERLAY 0038: iOS refuses to activate the audio session while another app
+    // holds it exclusively, during a call, or briefly right after a cold launch
+    // ("Could not activate Audio Session ... Session activation failed"). It is
+    // transient and usually clears well inside a second, so retry before giving
+    // up; the caller's fallback (Audio::InitAudioPlayer) no longer persists the
+    // failure, but a launch that keeps its sound is better than one that
+    // recovers on the next.
+    mDevice = 0;
+    for (int pbAttempt = 1; pbAttempt <= 5 && mDevice == 0; pbAttempt++) {
+        mDevice = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (mDevice == 0) {
+            SPDLOG_ERROR("SDL_OpenAudio error (attempt {}/5): {}", pbAttempt, SDL_GetError());
+            if (pbAttempt < 5) {
+                SDL_Delay(200);
+            }
+        }
+    }
+    if (mDevice == 0) {
+        return false;
+    }
+#else
+    mDevice = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (mDevice == 0) {
+        SPDLOG_ERROR("SDL_OpenAudio error: {}", SDL_GetError());
+        return false;
+    }
+#endif
+""",
+    1,
+))
+
+
+def main():
+    originals = {}
+    for rel, old, new, count in EDITS:
+        path = VENDOR / rel
+        text = originals.get(rel)
+        if text is None:
+            text = path.read_text()
+            originals[rel] = text
+        n = text.count(old)
+        assert n == count, f"{rel}: expected {count} match(es) of\n{old[:120]!r}\ngot {n}"
+        originals[rel] = text.replace(old, new, count)
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = pathlib.Path(td)
+        chunks = []
+        for rel in originals:
+            src = VENDOR / rel
+            backup = src.read_text()
+            (tmp / "orig").write_text(backup)
+            (tmp / "new").write_text(originals[rel])
+            diff = subprocess.run(
+                ["diff", "-u",
+                 "--label", f"a/{rel}", "--label", f"b/{rel}",
+                 str(tmp / "orig"), str(tmp / "new")],
+                capture_output=True, text=True)
+            assert diff.returncode == 1, f"{rel}: diff produced no change (rc={diff.returncode})"
+            chunks.append(diff.stdout)
+
+    header = __doc__.strip() + "\n\n"
+    OUT.write_text(header + "".join(chunks))
+    print(f"wrote {OUT.relative_to(ROOT)}")
+
+
+if __name__ == "__main__":
+    main()
