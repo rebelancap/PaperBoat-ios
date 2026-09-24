@@ -1570,9 +1570,12 @@ static void PBIos_ConsumePendingIntent(void) {
 // 2. SAMPLING. `nuContDataGet` reads the pad once per 30 Hz game tick, and
 //    `GameEngine_ReadController` is called from several entry points per frame.
 //    A press that begins and ends between two ticks would simply not exist, so
-//    every release arms a short EXPIRY (60 ms ~ 1.8 ticks) during which the bit
-//    is still published. Latching on "consume" instead would hide the press
-//    from every reader after the first one in the same frame.
+//    every press is published as a DOWN window and an UP window of at least one
+//    tick each (PaperBoatIosPadEdge.h). The 0.0.0.x-1.0.1 design instead kept
+//    a released bit alive for a fixed 60 ms, which merged any tap train with a
+//    gap under 60 ms into one hold — "spam hammer freezes the button"
+//    (user report, 2026-09-23). Latching on "consume" would hide the press from
+//    every reader after the first one in the same frame.
 // 3. MENU PASSTHROUGH IS INVERTED. The SoH port's overlay returns YES from
 //    `pointInside:` while the menu is open and routes the touches itself. Here
 //    overlay 0016 already reads menu swipes off ImGui's synthesised mouse, so
@@ -1584,6 +1587,7 @@ static void PBIos_ConsumePendingIntent(void) {
 // ---------------------------------------------------------------------------
 
 #include <stdatomic.h>
+#include "PaperBoatIosPadEdge.h"
 
 // Overlay 0024's engine-side exports. All three are safe before the engine is
 // up (they answer "no" / do nothing).
@@ -1606,11 +1610,13 @@ static _Atomic unsigned short gPBPadHeld = 0;    // bits currently under a finge
 static _Atomic signed char gPBPadStickX = 0;
 static _Atomic signed char gPBPadStickY = 0;
 static _Atomic int gPBPadLayerActive = 0;        // this layer owns input right now
-// Release expiries, one per N64 button bit. UIKit writes them on the main
-// thread; PBIos_ShellPadState is called from whichever thread is running the
-// game tick, so these are `_Atomic` for the same reason gPBPadHeld is — a
-// torn/stale double here is a button that sticks or never registers.
-static _Atomic double gPBPadExpiry[16];
+// Press sequence, one per N64 button bit: UIKit bumps it on every finger-down
+// (main thread); PBIos_ShellPadState reads it from whichever thread runs the
+// game tick and turns it into the published down/up windows. `_Atomic` for the
+// same reason gPBPadHeld is — a torn/stale count is a lost or stuck press.
+static _Atomic unsigned int gPBPadPressSeq[PB_PAD_EDGE_BITS];
+// The reader's own state. Touched only by PBIos_ShellPadState.
+static PBPadEdgeState gPBPadEdge;
 
 // N64 pad bits (include/PR/os_cont.h:121-134). Named here rather than included
 // so this file stays plain Objective-C with no engine headers.
@@ -1631,25 +1637,22 @@ static _Atomic double gPBPadExpiry[16];
 
 #define PB_STICK_MAX 80.0 // kStickMax, the N64 raw range the game reads
 
-// Press hold-over. 60 ms is just under two 30 Hz ticks: long enough that a
-// fast tap survives the sampler, short enough that it cannot read as a hold.
-#define PB_PRESS_HOLD_SECONDS 0.060
-
 static void PBIos_PadPress(unsigned short mask, BOOL down) {
     if (mask == 0) {
         return;
     }
     if (down) {
+        // Count the press BEFORE publishing the held bit, so a reader that
+        // sees the bit also sees a sequence it has not consumed.
+        for (int i = 0; i < PB_PAD_EDGE_BITS; i++) {
+            if (mask & (unsigned short)(1u << i)) {
+                atomic_fetch_add(&gPBPadPressSeq[i], 1u);
+            }
+        }
         atomic_fetch_or(&gPBPadHeld, mask);
         return;
     }
     atomic_fetch_and(&gPBPadHeld, (unsigned short)~mask);
-    const double until = CACurrentMediaTime() + PB_PRESS_HOLD_SECONDS;
-    for (int i = 0; i < 16; i++) {
-        if (mask & (unsigned short)(1u << i)) {
-            atomic_store(&gPBPadExpiry[i], until);
-        }
-    }
 }
 
 static void PBIos_PadReleaseAll(void) {
@@ -1665,13 +1668,12 @@ int PBIos_ShellPadState(unsigned short* buttons, signed char* sx, signed char* s
     if (!atomic_load(&gPBPadLayerActive)) {
         return 0;
     }
-    unsigned short b = atomic_load(&gPBPadHeld);
-    const double now = CACurrentMediaTime();
-    for (int i = 0; i < 16; i++) {
-        if (atomic_load(&gPBPadExpiry[i]) > now) {
-            b |= (unsigned short)(1u << i);
-        }
+    const unsigned short held = atomic_load(&gPBPadHeld);
+    unsigned int seq[PB_PAD_EDGE_BITS];
+    for (int i = 0; i < PB_PAD_EDGE_BITS; i++) {
+        seq[i] = atomic_load(&gPBPadPressSeq[i]);
     }
+    const unsigned short b = PBPadEdge_Step(&gPBPadEdge, held, seq, CACurrentMediaTime(), PB_PAD_EDGE_MIN_S);
     if (buttons != NULL) {
         *buttons = b;
     }
@@ -2367,8 +2369,8 @@ static NSArray<NSString*>* PBIos_LayoutKeys(void) {
     [self buttonRects:btns count:&n];
     NSString* sub = a.count >= 1 ? a[0].lowercaseString : @"list";
     if ([sub isEqualToString:@"pad"]) {
-        // Exactly the word overlay 0024 reads on the game tick, including the
-        // ~60 ms release hold-over. `active=0` means nothing is merged at all.
+        // Exactly the word overlay 0024 reads on the game tick, after the
+        // per-press edge publisher. `active=0` means nothing is merged at all.
         unsigned short buttons = 0;
         signed char psx = 0, psy = 0;
         const int active = PBIos_ShellPadState(&buttons, &psx, &psy);
