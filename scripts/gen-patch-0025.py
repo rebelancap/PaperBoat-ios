@@ -3,6 +3,24 @@
 
 CLASS: (b) upstream bug fix worth sending.
 
+REV 2 (round 26, upstream 1.0.2): A LATE FRAME NO LONGER MOVES THE METRONOME
+(iOS-gated). Upstream 1.0.2 runs the game on nusys threads and slaves the VI
+retrace to presents (`src/port/os/VI.cpp`: a present interval within 12 % of
+1x or 2x 16.67 ms drives the retrace). A frame can now reach the pacer LATE -
+it is only drawn once the tick that the previous present triggered has been
+simulated and submitted - and this function then sets `previous_time = t`, so
+every late millisecond is added to the cadence for good. Measured on the lane-2
+simulator at a 60 target (the measurement log M-037): present p50 17.69 ms instead of
+16.67, and because the VI is slaved to that, the WHOLE GAME followed it -
+`tps` ~28/30 (94 % speed) and the audio manager, which renders one frame per
+retrace, fell 6 % short of the 32 kHz the device drains: `aud_min=0`,
+~2 underruns a second. The fix keeps the deadline on the metronome when a frame
+is less than one interval late (`previous_time = next`), so the next frame's
+sleep absorbs the lateness instead of inheriting it; a frame later than a whole
+interval still resyncs to now, so a real stall does not produce a burst.
+Gated to `__IOS__` because that is where it was measured; the desktop paths
+present through vsync-blocking swaps and were not re-measured.
+
 THE BUG (all platforms, not just iOS)
 -------------------------------------
 `GfxWindowBackendSDL2::SyncFramerateWithTime` sleeps the frame out to its
@@ -106,6 +124,16 @@ NEW_CLAMP = """    // NOTE (overlay 0025): the cast is the fix. `t` is uint64_t 
         // don't let that slow down the framerate.
         t = next;
     }
+#ifdef __IOS__
+    // OVERLAY 0025 REV 2: a frame that arrives less than one interval LATE
+    // keeps the metronome where it was. With upstream 1.0.2's VI retrace
+    // slaved to presents, `previous_time = t` on a late frame slowed the whole
+    // game (and starved the audio manager) by the lateness, every frame.
+    else if ((int64_t)t >= next &&
+             (int64_t)t - next < (int64_t)(10 * FRAME_INTERVAL_US_NUMERATOR / FRAME_INTERVAL_US_DENOMINATOR)) {
+        t = next;
+    }
+#endif
 """
 text = replace_once(text, OLD_CLAMP, NEW_CLAMP, "early-wake clamp")
 

@@ -63,7 +63,7 @@ Match-count asserted against the pristine vendor state.
 
 --- a/external/libultraship/src/fast/interpreter.cpp
 +++ b/external/libultraship/src/fast/interpreter.cpp
-@@ -7015,7 +7015,21 @@
+@@ -7515,7 +7515,21 @@
      }
      return false;
  #endif
@@ -85,7 +85,7 @@ Match-count asserted against the pristine vendor state.
  
  void Interpreter::StartFrame() {
      mWapi->GetDimensions(&mGfxCurrentWindowDimensions.width, &mGfxCurrentWindowDimensions.height, &mCurWindowPosX,
-@@ -7023,7 +7037,49 @@
+@@ -7523,7 +7537,49 @@
      if (mCurDimensions.height == 0) {
          // Avoid division by zero
          mCurDimensions.height = 1;

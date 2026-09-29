@@ -57,7 +57,7 @@ Match-count asserted against the pristine vendor state.
 
 --- a/src/port/ui/PaperboatMenuSettings.cpp
 +++ b/src/port/ui/PaperboatMenuSettings.cpp
-@@ -288,6 +288,27 @@
+@@ -357,6 +357,27 @@
              );
          })
          .PreFunc([](WidgetInfo& info) {

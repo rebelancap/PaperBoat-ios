@@ -110,6 +110,15 @@ coexist and a mid-session flip is safe. Diagnostic only - deliberately NOT in
 Settings > iOS. It exists so a device read can price the change in one line
 instead of two builds.
 
+REV 3 (round 26, upstream 1.0.2): context only. LUS 3e3cd2ed's
+TextureCacheKey grew `indexed = 2` (an HD replacement's silhouette drawn as
+indices, `gDPPaletteMask`) and a `mask[2]` member; `palette_hash` now follows
+`mask[2]`. That new indexed=2 path, like indexed=1, only runs for palettized
+tiles, so with `gSohIos.PaletteInShader` at its default 0 it is not taken. An
+HD pack whose art relies on upstream's run-time-palette mixing may therefore
+draw differently here than on desktop (NOT verified - no official pack exists
+yet); stock assets are unaffected. No code change otherwise.
+
 REV 2 (round 20) - THE RUN-TIME PALETTE RING. The open half of rev 1 turned out
 to be real, and the user's 0.0.0.14 device line named it (M-032 §1):
 
@@ -167,10 +176,10 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
 
 --- a/external/libultraship/include/fast/interpreter.h
 +++ b/external/libultraship/include/fast/interpreter.h
-@@ -220,6 +220,13 @@
-     // 1 = uploaded as a CI index texture (palette applied in the shader). Indexed
-     // entries do not key on palette contents, which is what makes TLUT swaps free.
+@@ -224,6 +224,13 @@
+     // the entries its opaque and transparent pixels read.
      uint8_t indexed;
+     uint8_t mask[2];
 +    // PAPERBOAT (overlay 0036 rev 2): FNV-1a over exactly the TLUT bytes a CPU
 +    // decode reads (32 for a CI4 bank, 512 for CI8's two halves). Non-zero
 +    // REPLACES palette_addrs/palette_index in the key for a CPU-decoded CI
@@ -181,8 +190,8 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
  
      bool operator==(const TextureCacheKey&) const noexcept = default;
  
-@@ -543,6 +550,10 @@
-     void TextureCacheClear();
+@@ -565,6 +572,10 @@
+     GfxCacheStats ConsumeGfxCacheStats();
      std::shared_ptr<Ship::IResource> ResolveResourceCached(const char* path);
      bool TextureCacheLookup(int i, const TextureCacheKey& key);
 +    // PAPERBOAT (overlay 0036 rev 2): hash of the TLUT bytes this tile's CPU
@@ -191,8 +200,8 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
 +    uint64_t PbPaletteContentHash(uint8_t siz, uint8_t paletteIndex) const;
      void TextureCacheDelete(const uint8_t* origAddr);
      void TextureCacheDeleteByPalette(const uint8_t* palAddr);
-     void ImportTextureRgba16(int tile, bool importReplacement);
-@@ -826,7 +837,28 @@
+     void TextureCacheDrop(int i);
+@@ -863,7 +874,28 @@
      // shown because the HD upload was deferred (red). 0 = no replacement / no tint.
      bool mTextureReplacementDebug = false;
      int mDebugTintState = 0;
@@ -223,7 +232,7 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
      // thread pool while the cheap vanilla version renders; the HD swaps in once its load
 --- a/external/libultraship/src/fast/interpreter.cpp
 +++ b/external/libultraship/src/fast/interpreter.cpp
-@@ -939,6 +939,11 @@
+@@ -1069,6 +1069,11 @@
      }
  
      it = mTextureCache.map.insert(std::make_pair(key, TextureCacheValue())).first;
@@ -234,9 +243,9 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
 +    }
      TextureCacheNode* node = &*it;
      node->second.texture_id = texture_id;
-     node->second.lru_location = mTextureCache.lru.insert(mTextureCache.lru.end(), { it });
-@@ -1046,11 +1051,70 @@
-     }
+     node->second.bytes = 0;
+@@ -1312,11 +1317,70 @@
+     mRenderingState.mTextures[i] = nullptr;
  }
  
 +// OVERLAY 0036 REV 2: a hash of exactly the TLUT bytes this tile's CPU decode
@@ -306,7 +315,7 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
      for (auto it = mTextureCache.map.begin(); it != mTextureCache.map.end();) {
          if (it->first.palette_addrs[0] == palAddr || it->first.palette_addrs[1] == palAddr) {
              for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
-@@ -2440,6 +2504,24 @@
+@@ -2873,6 +2937,24 @@
          key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes };
      }
      key.mip_levels = mCurrentMipExtraLevels;
@@ -331,7 +340,7 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
      if (mImportIndexed) {
          // Index textures don't depend on palette contents: the palette lookup
          // happens in the shader, so TLUT swaps reuse the same cache entry.
-@@ -3032,7 +3114,15 @@
+@@ -3492,7 +3574,15 @@
      mDebugTintState = 0;
  
      bool palettized[2] = { false, false };
@@ -348,7 +357,7 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
          uint32_t pal_tile = mRdp->first_tile_index + i;
          if (i == 1 && mRdp->first_tile_index >= 2) {
              pal_tile = mRdp->first_tile_index;
-@@ -7167,6 +7257,23 @@
+@@ -7667,6 +7757,23 @@
      mAsyncTextureLoad = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
                              "gEnhancements.Graphics.AsyncTextureLoad", 0) != 0;
  

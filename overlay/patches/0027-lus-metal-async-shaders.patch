@@ -429,7 +429,7 @@ already carry, plus the ownership fix they all still need.
  
      return it == mShaderProgramPool.end() ? nullptr : (struct ShaderProgram*)&it->second;
  }
-@@ -691,10 +925,28 @@
+@@ -692,10 +926,28 @@
      current_framebuffer.mCommandEncoder->setCullMode(cull);
  
      if (current_framebuffer.mLastShaderProgram != mShaderProgram) {

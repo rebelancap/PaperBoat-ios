@@ -36,24 +36,22 @@ iOS, so this is a hard prerequisite for the first rendered iOS frame.
 reference parameter is legal and meaningful. Only the opaque types and the one
 by-value scalar change.
 
-WHICH FILE SHIPS. port/ is zipped whole into paperboat.o2r by the
-GeneratePortO2R target (root CMakeLists.txt), and gfx_metal_shader.cpp loads
-"shaders/metal/default.shader.metal" through the resource manager — so
-port/shaders/metal/default.shader.metal is the copy the app actually compiles.
-port/shaders/metal/srgb.shader.metal has no such parameters. libultraship's own
-src/fast/shaders/metal/default.shader.metal carries the identical defect but is
-not packaged by any target in this build (nothing references that directory);
-it is where an upstream PR would have to fix it a second time, and it is left
-untouched here so the overlay stays exactly as wide as the shipped bug.
+WHICH FILE SHIPS (revised for upstream 1.0.2, round 26). Upstream a90381914
+"Use the shader files provided by LUS" deleted port/shaders/ and now stages
+libultraship's src/fast/shaders/ into paperboat.o2r's shaders/ (root
+CMakeLists.txt, GeneratePortO2R). So the file the app compiles is now
+external/libultraship/src/fast/shaders/metal/default.shader.metal, which carries
+the identical defect (same 6 + 6 + 1 occurrences) — the patch simply moved with
+the file. srgb.shader.metal still has no such parameters.
 
-Because the o2r is a CONFIGURE_DEPENDS glob over port/*, editing the shader
+Because the o2r is a CONFIGURE_DEPENDS glob over port/* and the LUS shaders, editing the shader
 makes the build regenerate paperboat.o2r on its own.
 """
 import subprocess, pathlib, tempfile, re
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 VENDOR = ROOT / "vendor/PaperBoat"
-REL = "port/shaders/metal/default.shader.metal"
+REL = "external/libultraship/src/fast/shaders/metal/default.shader.metal"
 OUT = ROOT / "overlay/patches/0002-paperboat-metal-shader-address-space.patch"
 
 src = VENDOR / REL

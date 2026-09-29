@@ -65,7 +65,7 @@ Match-count asserted against the pristine vendor state.
 
 --- a/src/port/Engine.cpp
 +++ b/src/port/Engine.cpp
-@@ -344,15 +344,39 @@
+@@ -361,15 +361,39 @@
  
      return font;
  }

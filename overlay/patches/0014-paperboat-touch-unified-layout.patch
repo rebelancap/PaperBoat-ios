@@ -369,7 +369,7 @@ hidden forever with no UI left to find it).
      }
 --- a/src/port/ui/PaperboatMenuSettings.cpp
 +++ b/src/port/ui/PaperboatMenuSettings.cpp
-@@ -251,6 +251,21 @@
+@@ -320,6 +320,21 @@
              CVarSetInteger(CVAR_TOUCH("EditMode"), 1);
              Ship::Context::GetRawInstance()->GetWindow()->GetGui()->GetMenu()->Hide();
          });

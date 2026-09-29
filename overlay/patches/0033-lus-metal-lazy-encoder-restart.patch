@@ -203,7 +203,7 @@ abort at all (M-032 §3).
      auto framebuffer = mFramebuffers[0];
  
      // Workaround for detecting when transitioning to/from full screen mode.
-@@ -490,6 +491,7 @@
+@@ -491,6 +492,7 @@
  }
  
  void GfxRenderingAPIMetal::SetViewport(int x, int y, int width, int height) {
@@ -211,7 +211,7 @@ abort at all (M-032 §3).
      FramebufferMetal& fb = mFramebuffers[mCurrentFramebuffer];
  
      fb.mViewport->originX = x;
-@@ -503,6 +505,7 @@
+@@ -504,6 +506,7 @@
  }
  
  void GfxRenderingAPIMetal::SetScissor(int x, int y, int width, int height) {
@@ -219,7 +219,7 @@ abort at all (M-032 §3).
      FramebufferMetal& fb = mFramebuffers[mCurrentFramebuffer];
      TextureDataMetal tex = mTextures[fb.mTextureId];
  
-@@ -523,6 +526,7 @@
+@@ -524,6 +527,7 @@
      NS::AutoreleasePool* autorelease_pool = NS::AutoreleasePool::alloc()->init();
      bool textures_changed = false;
  
@@ -227,7 +227,7 @@ abort at all (M-032 §3).
      auto& current_framebuffer = mFramebuffers[mCurrentFramebuffer];
  
      if (current_framebuffer.mLastDepthTest != mCurrentDepthTest ||
-@@ -814,6 +818,18 @@
+@@ -815,6 +819,18 @@
      // Cleanup states
      for (int fb_id = 0; fb_id < (int)mFramebuffers.size(); fb_id++) {
          FramebufferMetal& fb = mFramebuffers[fb_id];
@@ -246,7 +246,7 @@ abort at all (M-032 §3).
  
          fb.mLastShaderProgram = nullptr;
          fb.mCommandBuffer = nullptr;
-@@ -834,6 +850,19 @@
+@@ -835,6 +851,19 @@
      }
  
      mFrameAutoreleasePool->release();
@@ -266,7 +266,7 @@ abort at all (M-032 §3).
  }
  
  void GfxRenderingAPIMetal::FinishRender() {
-@@ -1066,6 +1095,90 @@
+@@ -1067,6 +1096,90 @@
      autorelease_pool->release();
  }
  
@@ -357,7 +357,7 @@ abort at all (M-032 §3).
  void GfxRenderingAPIMetal::StartDrawToFramebuffer(int fb_id, float noise_scale) {
      FramebufferMetal& fb = mFramebuffers[fb_id];
      mRenderTargetHeight = mTextures[fb.mTextureId].height;
-@@ -1087,10 +1200,17 @@
+@@ -1088,10 +1201,17 @@
              fb.mCommandBuffer->enqueue();
          }
  
@@ -379,7 +379,7 @@ abort at all (M-032 §3).
      }
  
      if (noise_scale != 0.0f) {
-@@ -1107,8 +1227,16 @@
+@@ -1108,8 +1228,16 @@
  
      auto& framebuffer = mFramebuffers[mCurrentFramebuffer];
  
@@ -398,7 +398,7 @@ abort at all (M-032 §3).
  
      // Track the original load action and set the next load actions to Load to leverage the blit results
      MTL::RenderPassColorAttachmentDescriptor* srcColorAttachment =
-@@ -1182,7 +1310,12 @@
+@@ -1183,7 +1311,12 @@
      if (fb_id_target != 0) {
          // Copy over the source framebuffer's texture to the target
          auto& source_framebuffer = mFramebuffers[fb_id_source];
@@ -412,7 +412,7 @@ abort at all (M-032 §3).
          source_framebuffer.mHasEndedEncoding = true;
  
          MTL::BlitCommandEncoder* blit_encoder = source_framebuffer.mCommandBuffer->blitCommandEncoder();
-@@ -1192,7 +1325,12 @@
+@@ -1193,7 +1326,12 @@
      } else {
          // End the current render encoder
          auto& target_framebuffer = mFramebuffers[fb_id_target];
@@ -426,7 +426,7 @@ abort at all (M-032 §3).
  
          // Create a blit encoder
          MTL::BlitCommandEncoder* blit_encoder = target_framebuffer.mCommandBuffer->blitCommandEncoder();
-@@ -1307,29 +1445,13 @@
+@@ -1308,29 +1446,13 @@
      if (src.mCommandEncoder != nullptr && !src.mHasEndedEncoding) {
          src.mCommandEncoder->endEncoding();
  
@@ -463,7 +463,7 @@ abort at all (M-032 §3).
  
          src.mHasBoundVertexShader = false;
          src.mHasBoundFragShader = false;
-@@ -1368,9 +1490,23 @@
+@@ -1369,9 +1491,23 @@
      int target_texture_id = mFramebuffers[fb_dst_id].mTextureId;
      MTL::Texture* target_texture = mTextures[target_texture_id].texture;
  
@@ -489,7 +489,7 @@ abort at all (M-032 §3).
      // Create a blit encoder
      MTL::BlitCommandEncoder* blit_encoder = source_framebuffer.mCommandBuffer->blitCommandEncoder();
      blit_encoder->setLabel(NS::String::string("Copy Framebuffer Encoder", NS::UTF8StringEncoding));
-@@ -1384,36 +1520,17 @@
+@@ -1385,36 +1521,17 @@
                                    target_origin);
      blit_encoder->endEncoding();
  
@@ -536,7 +536,7 @@ abort at all (M-032 §3).
      // Reset the framebuffer so the encoder is setup again when rendering triangles
      source_framebuffer.mHasBoundVertexShader = false;
      source_framebuffer.mHasBoundFragShader = false;
-@@ -1515,6 +1632,8 @@
+@@ -1516,6 +1633,8 @@
          framebuffer.mCommandBuffer = nullptr;
          framebuffer.mCommandEncoder = nullptr;
          framebuffer.mHasEndedEncoding = false;

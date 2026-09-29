@@ -163,7 +163,16 @@ fi
 # They are NOT interchangeable: the three buttons overlap in a region about
 # 2 pt wide, and a single shared coordinate missed every prompt on the first
 # unattended run. All three are tapped on every dialog (see below).
-YES_TAPS=("202 409" "192 413" "202 400")
+# Round 26 (upstream 1.0.2): the three dialogs are laid out differently (text
+# and buttons moved), so the 1.0.0 coordinates hit dead dialog background. The
+# 1.0.2 buttons, measured off m037 screenshots the same way (landscape pt):
+#   No O2R:        Yes x 320-350, No x 357-384, y 221-242
+#   ROMs found:    Yes x 329-359, No x 367-393, y 247-267
+#   Run PaperBoat: Yes x 295-326, No x 333-359, y 221-242
+# "No" on Run PaperBoat QUITS the app, and it overlaps No O2R's Yes, so each
+# tap below is chosen to hit its own Yes and only a Yes or dead background on
+# the other two: landscape (325,231), (340,257), (310,231).
+YES_TAPS=("189 325" "163 340" "189 310")
 
 TIMEOUT="${PAPERBOAT_SIM_TIMEOUT:-480}"
 info "polling for the title screen (up to ${TIMEOUT}s)"

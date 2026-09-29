@@ -55,16 +55,16 @@ The port supports Harbour Masters' `.o2r` mods, including texture packs. **Maste
 official Paper Mario `.o2r` pack is in progress** — when it lands, installing it is:
 
 1. Copy the `.o2r` into *On My iPhone → PaperBoat → **mods*** in the Files app.
-2. Relaunch, then turn **Use Alternate Assets** on — *Settings → Enhancements → Graphics
-   → Mods*, or the same checkbox in the **Mod Menu**.
+2. Relaunch, then turn **Use Alternate Assets** on in the **Mod Menu** (*Settings → Mod
+   Menu*).
 
 That toggle is **off by default in this port**, so nothing happens until you tick it —
 which also makes it a one-tap A/B against vanilla.
 
 On a phone, prefer the **HD** flavour of any pack over a 4K one. The phone's panel cannot
 resolve 4K texel detail, and the extra resident texture memory is what pushes an app into
-being killed for memory. The port keeps a texture-memory budget for exactly this reason
-(*Settings → iOS*), but a smaller pack is the better fix.
+being killed for memory. PaperBoat keeps a texture-memory budget for exactly this reason
+(*Settings → Graphics → Texture Cache Size*), but a smaller pack is the better fix.
 
 ## Features
 
@@ -159,7 +159,7 @@ binary that no listener survives.
 
 ## Credits & license
 
-- [PaperBoat](https://github.com/HarbourMasters/PaperBoat) **1.0.0** by **Caladius** and
+- [PaperBoat](https://github.com/HarbourMasters/PaperBoat) **1.0.2** by **Caladius** and
   the Harbour Masters contributors — the port this is built on, and the source of its
   iOS target, on-device extractor and enhancements menu
 - [libultraship](https://github.com/HarbourMasters/libultraship) (MIT), in the

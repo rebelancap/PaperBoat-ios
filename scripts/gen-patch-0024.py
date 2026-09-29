@@ -3,6 +3,15 @@
 
 CLASS: (a) program-baseline parity.
 
+REV 3 (round 26, upstream 1.0.2): THE CALL SITE MOVED, NOTHING ELSE DID.
+Upstream 1.0.2 runs nusys on emulated N64 threads (src/port/os/) and deleted
+`GameEngine_ReadController`; the pad is now latched in `OS_SiService()`
+(`src/port/os/Cont.cpp`), on the main thread, when the game has asked for a
+read (`osContStartReadData`). Upstream's own `TouchControls_ApplyPad` moved
+there with it, so the shell's merge goes beside it exactly as before. Same
+thread as rev 2 (the main loop), same once-per-read sampling, same D35 edge
+publication in the shell.
+
 REV 2 (round 17): an `#else` no-op for `TouchControls_ApplyShellPad`. The call
 site in `GameEngine_ReadController()` is unconditional but rev 1 only DEFINED
 the function inside `#if defined(PLATFORM_IOS) || defined(__IOS__)`, so the
@@ -77,8 +86,9 @@ in SafeRect/LoadPos, 0014's in ComputeLayout and the hideable table - hundreds
 of lines from either end.
 `TouchControls.h`: one declaration appended to the existing extern "C" block's
 neighbourhood, clear of 0014's block.
-`Engine.cpp`: one line inside `GameEngine_ReadController` (~:1533). Overlay
-0012's hunks are at ~:1137+, 0022's at ~:357, 0023's at ~:994, 0004's at ~:190.
+`os/Cont.cpp`: one line inside `OS_SiService` (~:66). No other patch in the
+series touches that file (rev 3; it was `Engine.cpp`'s `GameEngine_ReadController`
+before upstream 1.0.2).
 
 Match-count asserted against the pristine vendor state.
 """
@@ -90,7 +100,7 @@ OUT = ROOT / "overlay/patches/0024-paperboat-ios-shell-touch-pad.patch"
 
 TC_REL = "src/port/ui/TouchControls.cpp"
 TH_REL = "src/port/ui/TouchControls.h"
-EN_REL = "src/port/Engine.cpp"
+EN_REL = "src/port/os/Cont.cpp"
 
 
 def replace_once(t, old, new, tag, rel):
@@ -188,7 +198,7 @@ NEW_TAIL = """} // namespace PaperboatGui
 // app/ios/PaperBoatIosShell.m draws a UIKit overlay - the same one every
 // sibling port ships - and publishes its state as an N64 pad word plus a stick
 // pair. This is where that state joins the game's input, one call after
-// upstream's own TouchControls_ApplyPad() in GameEngine_ReadController().
+// upstream's own TouchControls_ApplyPad() in OS_SiService() (os/Cont.cpp).
 //
 // The shell answers 0 whenever its layer is not driving input (the CVar is off,
 // upstream's pad is enabled instead, the menu or a modal is up, the customizer
@@ -266,7 +276,7 @@ extern "C" void PBIos_ToggleMenu(void) {
 }
 #else
 // REV 2 (round 17): the macOS ORACLE has to link too. The call site in
-// GameEngine_ReadController() is unconditional - deliberately, so the input
+// OS_SiService() (os/Cont.cpp) is unconditional - deliberately, so the input
 // path reads the same on every platform - so the symbol must exist everywhere,
 // and off iOS there is no shell to ask. A no-op, and the only thing the oracle
 // ever does with it.
@@ -283,25 +293,25 @@ extern "C" void TouchControls_ApplyShellPad(void* pads) {
 tc = replace_once(tc, OLD_TAIL, NEW_TAIL, "end of namespace PaperboatGui", TC_REL)
 
 # ---------------------------------------------------------------------------
-# 3. Engine.cpp - the call site
+# 3. os/Cont.cpp - the call site (rev 3; was Engine.cpp before upstream 1.0.2)
 # ---------------------------------------------------------------------------
 en_src = VENDOR / EN_REL
 en_orig = en_src.read_text()
 
-OLD_ENGINE = """    // Merges the on-screen controls into port 0; no-op unless enabled.
-    TouchControls_ApplyPad(pads);
-}
+OLD_ENGINE = """        // Merges the on-screen controls into port 0; no-op unless enabled.
+        TouchControls_ApplyPad(sLatch);
+    }
 """
 
-NEW_ENGINE = """    // Merges the on-screen controls into port 0; no-op unless enabled.
-    TouchControls_ApplyPad(pads);
-    // PAPERBOAT_IOS (overlay 0024): and the app shell's unified UIKit touch
-    // layer, which is the pad iOS actually ships with. No-op off iOS, and
-    // no-op on iOS whenever that layer is not driving input.
-    TouchControls_ApplyShellPad(pads);
-}
+NEW_ENGINE = """        // Merges the on-screen controls into port 0; no-op unless enabled.
+        TouchControls_ApplyPad(sLatch);
+        // PAPERBOAT_IOS (overlay 0024): and the app shell's unified UIKit touch
+        // layer, which is the pad iOS actually ships with. No-op off iOS, and
+        // no-op on iOS whenever that layer is not driving input.
+        TouchControls_ApplyShellPad(sLatch);
+    }
 """
-en = replace_once(en_orig, OLD_ENGINE, NEW_ENGINE, "GameEngine_ReadController touch merge", EN_REL)
+en = replace_once(en_orig, OLD_ENGINE, NEW_ENGINE, "OS_SiService touch merge", EN_REL)
 
 OUT.write_text(__doc__ + "\n"
                + unified(TH_REL, th_orig, th)

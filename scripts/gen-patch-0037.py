@@ -2,6 +2,31 @@
 """Overlay patch 0037 - a real `DeleteTexture`, and a BYTE budget beside the
 1024-entry count cap.
 
+REV 2 (round 26, upstream 1.0.2): UPSTREAM NOW OWNS THE BUDGET; THIS PATCH KEEPS
+THE FREE. LUS 3e3cd2ed ("Allow a port to configure the max texture cache size")
+and PaperBoat 6ffb5207d/b1a331d8b gave the interpreter its own byte ledger
+(`resident_bytes`, charged in `TextureCacheAccountUpload`), a byte budget with an
+eviction loop (`SetTextureCacheBudgetBytes`), a `TextureCacheEvictOldest` that
+refuses to evict a BOUND entry (the same strictness rev 1 added), and a
+Settings > Graphics "Texture Cache" size (`gGraphics.TextureCache`,
+`src/port/TextureCache.cpp`: Auto = 5/8 of a RAM-derived ceiling, 16384-entry
+count cap). That is parts 2 and 3 of rev 1 done upstream, so rev 1's eviction
+loop, `gSohIos.TexCacheBudgetMB` and the shell-chosen default
+(`PBIos_TexCacheBudgetDefaultMB`, D33) are DROPPED in favour of upstream's.
+
+What upstream still lacks is part 1: `GfxRenderingAPIMetal::DeleteTexture` is
+still an empty body and nothing on the eviction path calls it, so an evicted
+MTLTexture stays resident until its id is recycled at different dimensions -
+the budget bounds what the cache THINKS is resident, not what is. Rev 2 keeps
+the real release and the Metal byte ledger, and adds ONE call: upstream's
+`TextureCacheEvictOldest` now hands the evicted id to `DeleteTexture` before
+deferring it. The four `gPBIosTexCache*` counters stay (overlay 0012's
+`texcache` group and the bridge's `texcache` verb); `budget_mb` now reports
+upstream's `mTextureCacheMaxBytes`, and `bytes` is still the Metal ledger's
+real GPU bytes.
+
+Rev 1's text follows; its "THE BUDGET" section is history.
+
 CLASS: (b) upstream bug fix worth sending to JeodC/libultraship (the SoH port
 carries the same fix as its own overlay 0020; the bug is in Kenix3's tree too).
 Not iOS-gated: the macOS oracle must behave the same way, and the budget lever
@@ -276,18 +301,17 @@ EDITS.append((
 ))
 
 # ---------------------------------------------------------------------------
-# 5. The interpreter: one eviction loop, both bounds, and the counters.
+# 5. The interpreter (rev 2): the release on upstream's eviction path, and the
+#    counters. Upstream owns the budget and the eviction loop now.
 # ---------------------------------------------------------------------------
 EDITS.append((
     "external/libultraship/include/fast/interpreter.h",
     """    GfxTextureCache mTextureCache{};
 """,
     """    GfxTextureCache mTextureCache{};
-    // OVERLAY 0037: the byte budget's latched value (bytes; 0 = no budget) and
-    // the lookup counter that decides when to re-read the CVar. Latched rather
-    // than read per lookup because TextureCacheLookup is the hottest function
-    // in the texture path.
-    size_t mPbTexBudgetBytes = 0;
+    // OVERLAY 0037: lookup counter that paces republishing the gPBIosTexCache*
+    // counters (every 512 lookups, hit or miss) - TextureCacheLookup is the
+    // hottest function in the texture path.
     uint32_t mPbTexLookups = 0;
 """,
     1,
@@ -295,72 +319,36 @@ EDITS.append((
 
 EDITS.append((
     "external/libultraship/src/fast/interpreter.cpp",
-    """    if (mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE) {
-        // Remove the texture that was least recently used
-        it = mTextureCache.lru.front().it;
-        mTextureCache.deferred_free_texture_ids.push_back(it->second.texture_id);
-        for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
-            if (mRenderingState.mTextures[j] == &*it)
-                mRenderingState.mTextures[j] = nullptr;
-        }
-        mTextureCache.map.erase(it);
-        mTextureCache.lru.pop_front();
-    }
+    """    mGfxCacheStats.evictions++;
+    TextureCacheMap::iterator it = lruIt->it;
+    mTextureCache.deferred_free_texture_ids.push_back(it->second.texture_id);
 """,
-    """    // OVERLAY 0037: evict until BOTH bounds hold - upstream's entry count, and
-    // a BYTE budget the count alone cannot express (an entry is 16 KB of N64 CI
-    // tile or 64 MB of 4K replacement). Every eviction now calls DeleteTexture,
-    // which is also what finally makes the COUNT cap free memory: the Metal
-    // backend's DeleteTexture was an empty function, so an evicted id kept its
-    // MTLTexture until it was reused at different dimensions.
-    while (!mTextureCache.lru.empty()) {
-        const bool pbOverCount = mTextureCache.map.size() >= TEXTURE_CACHE_MAX_SIZE;
-        const bool pbOverBytes = mPbTexBudgetBytes != 0 && mRapi->GetTextureBytes() > mPbTexBudgetBytes &&
-                                 mTextureCache.map.size() > 128;
-        if (!pbOverCount && !pbOverBytes) {
-            break;
-        }
-        // Stricter than upstream: never evict an entry that is BOUND right now.
-        // The old code evicted it anyway and papered over it by nulling the
-        // rendering-state pointer, which was harmless only because the texture
-        // was never actually released. It is released now.
-        TextureCacheMap::iterator pbEvict = mTextureCache.lru.front().it;
-        bool pbBound = false;
-        for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
-            if (mRenderingState.mTextures[j] == &*pbEvict) {
-                pbBound = true;
-            }
-        }
-        if (pbBound) {
-            break;
-        }
-        mRapi->DeleteTexture(pbEvict->second.texture_id);
-        mTextureCache.deferred_free_texture_ids.push_back(pbEvict->second.texture_id);
-        mTextureCache.map.erase(pbEvict);
-        mTextureCache.lru.pop_front();
-        gPBIosTexCacheEvicts++;
-    }
-    // Republished here because this is where the numbers move. Sampled before
-    // the insert below rather than after it, so this patch's context stays
-    // clear of overlay 0036's hunk: `entries` is the count BEFORE the entry
-    // this lookup is about to admit.
-    gPBIosTexCacheEntries = (uint32_t)mTextureCache.map.size();
-    gPBIosTexCacheBytes = (uint64_t)mRapi->GetTextureBytes();
-    gPBIosTexCacheBudgetMB = (uint32_t)(mPbTexBudgetBytes / (1024 * 1024));
+    """    mGfxCacheStats.evictions++;
+    TextureCacheMap::iterator it = lruIt->it;
+    // OVERLAY 0037: actually free the evicted texture. Without this the Metal
+    // backend keeps the MTLTexture (DeleteTexture was an empty body, and nothing
+    // here called it) until the id is recycled at different dimensions, so the
+    // byte budget above bounded the ledger, not the GPU memory. Safe mid-frame:
+    // command buffers retain what their encoders reference, the id recycling is
+    // deferred a frame, and bound entries are never chosen (the loop above).
+    mRapi->DeleteTexture(it->second.texture_id);
+    gPBIosTexCacheEvicts++;
+    mTextureCache.deferred_free_texture_ids.push_back(it->second.texture_id);
 """,
     1,
 ))
 
-# The counters and the budget default, defined just above TextureCacheLookup.
+# The counters, defined just above TextureCacheLookup, and republished there.
 EDITS.append((
     "external/libultraship/src/fast/interpreter.cpp",
     """bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
 """,
     """// OVERLAY 0037: the texture cache's own ledger, read by overlay 0012's report
 // (the `fps` line's `texcache=` group and the bridge's `texcache` verb).
-// Written on the game thread and read on the main thread, which on iOS is the
-// same thread; `volatile` for the same reason gPBIosGpuMs is, and no
-// <atomic> include is added to this translation unit for four counters.
+// Written and read on the main thread (the render thread; the game runs on its
+// own threads since upstream 1.0.2 but never touches the interpreter), so
+// `volatile` for the same reason gPBIosGpuMs is, and no <atomic> include is
+// added to this translation unit for four counters.
 // `extern "C"`, and not for the ABI: this translation unit is inside
 // `namespace Fast`, so without it the four symbols are mangled into that
 // namespace and Engine.cpp's declarations do not resolve.
@@ -369,32 +357,15 @@ extern "C" volatile uint64_t gPBIosTexCacheBytes = 0;
 extern "C" volatile uint32_t gPBIosTexCacheEntries = 0;
 extern "C" volatile uint32_t gPBIosTexCacheBudgetMB = 0;
 
-// The default budget in MB. On iOS the shell picks it from the device's
-// physical memory (D33); elsewhere it is the SoH port's flat 1536 MB, which is
-// also what the oracle gets so an A/B can be run there.
-#ifdef __IOS__
-extern "C" int PBIos_TexCacheBudgetDefaultMB(void);
-#endif
-static int32_t PbTexCacheBudgetDefaultMB() {
-#ifdef __IOS__
-    return (int32_t)PBIos_TexCacheBudgetDefaultMB();
-#else
-    return 1536;
-#endif
-}
-
 bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
-    // OVERLAY 0037: the budget is re-read (and the ledger republished) every 512
-    // lookups, HIT OR MISS - a fraction of a second - so `set
-    // gSohIos.TexCacheBudgetMB N` over the bridge is a live A/B with no rebuild
-    // and `texcache` does not go stale in a scene that is fully cached.
+    // OVERLAY 0037: republish the ledger every 512 lookups, HIT OR MISS - a
+    // fraction of a second - so `texcache` does not go stale in a scene that is
+    // fully cached. The budget is upstream's (Settings > Graphics > Texture
+    // Cache); `bytes` is the Metal backend's exact resident total.
     if ((mPbTexLookups++ % 512) == 0) {
-        const int32_t pbBudgetMb = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
-            "gSohIos.TexCacheBudgetMB", PbTexCacheBudgetDefaultMB());
-        mPbTexBudgetBytes = pbBudgetMb > 0 ? (size_t)pbBudgetMb * 1024 * 1024 : 0;
         gPBIosTexCacheEntries = (uint32_t)mTextureCache.map.size();
         gPBIosTexCacheBytes = (uint64_t)mRapi->GetTextureBytes();
-        gPBIosTexCacheBudgetMB = (uint32_t)(mPbTexBudgetBytes / (1024 * 1024));
+        gPBIosTexCacheBudgetMB = (uint32_t)(mTextureCacheMaxBytes / (1024 * 1024));
     }
 """,
     1,

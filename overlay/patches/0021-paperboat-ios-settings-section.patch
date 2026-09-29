@@ -104,7 +104,7 @@ Match-count asserted against the pristine vendor state.
 
 --- a/src/port/ui/PaperboatMenuSettings.cpp
 +++ b/src/port/ui/PaperboatMenuSettings.cpp
-@@ -47,6 +47,41 @@
+@@ -65,6 +65,41 @@
      { 0, "Top Left" }, { 1, "Top Right" }, { 2, "Bottom Left" }, { 3, "Bottom Right" }, { 4, "Hidden" },
  };
  
@@ -146,10 +146,12 @@ Match-count asserted against the pristine vendor state.
  void PaperboatMenu::AddMenuSettings() {
      // Add Settings Menu
      AddMenuEntry("Settings", CVAR_SETTING("Menu.SettingsSidebarSection"));
-@@ -142,7 +177,179 @@
-                 .LabelPosition(LabelPositions::Far)
-         )
-         .Callback([](WidgetInfo& info) { GameEngine::Instance->ScaleImGui(); });
+@@ -209,9 +244,181 @@
+             ButtonOptions().Tooltip(
+                 "Bring a save across from an emulator or console. Accepts .fla, .srm "
+                 "and raw flash dumps.\n\nThis overwrites the files you have here."
++            )
++        );
 +
 +#ifdef __IOS__
 +    // -----------------------------------------------------------------------
@@ -242,7 +244,7 @@ Match-count asserted against the pristine vendor state.
 +                .IsPercentage()
 +                .Tooltip("Size of this menu and its text. Applies immediately.")
 +        );
- 
++
 +    AddWidget(path, "Display", WIDGET_SEPARATOR_TEXT);
 +    // Labelled SSAA (the user, 0.0.0.8: "Supersampling should be called SSAA");
 +    // the tooltip still spells out what it does. DefaultValue is the SHELL's
@@ -260,8 +262,8 @@ Match-count asserted against the pristine vendor state.
 +                "Renders above the screen's resolution and scales down, which "
 +                "removes shimmer on edges.\n\n1.00x already renders at your "
 +                "display's full native resolution. Higher values cost GPU time."
-+            )
-+        );
+             )
+         );
 +    AddWidget(path, "Max Frame Rate", WIDGET_CVAR_COMBOBOX)
 +        .CVar("gSohIos.MaxFps")
 +        .RaceDisable(false)
@@ -282,7 +284,7 @@ Match-count asserted against the pristine vendor state.
 +                "Shows frame rate and thermal state in the corner of the screen."
 +            )
 +        );
-+
+ 
 +    // Round 13 (the ~5 s stutter, the design notes D26). Both of these are here
 +    // rather than under Display because neither is a thing a player tunes for
 +    // taste - they exist so a stutter report can be A/B'd in one session.
@@ -326,7 +328,7 @@ Match-count asserted against the pristine vendor state.
      // Settings > Audio
      path.sidebarName = "Audio";
      path.column = SECTION_COLUMN_1;
-@@ -213,6 +420,34 @@
+@@ -282,6 +489,34 @@
          .Options(WindowButtonOptions().Tooltip("Enables the separate Bindings Window."));
  
      AddWidget(path, "Touch Controls", WIDGET_SEPARATOR_TEXT);
@@ -361,7 +363,7 @@ Match-count asserted against the pristine vendor state.
      AddWidget(path, "Enable Touch Controls", WIDGET_CVAR_CHECKBOX)
          .CVar(CVAR_TOUCH("Enabled"))
          .RaceDisable(false)
-@@ -222,6 +457,7 @@
+@@ -291,6 +526,7 @@
                  "desktop the mouse can drive it for testing."
              )
          );
@@ -478,7 +480,7 @@ Match-count asserted against the pristine vendor state.
  void SetupMenu() {
      auto gui = Ship::Context::GetRawInstance()->GetWindow()->GetGui();
      mPaperboatMenu = std::make_shared<PaperboatGui::PaperboatMenu>(CVAR_WINDOW("Menu"), "Port Menu");
-@@ -101,6 +194,15 @@
+@@ -102,6 +195,15 @@
      mTouchControlsOverlay = std::make_shared<TouchControlsOverlay>(CVAR_WINDOW("TouchControls"), "##TouchControls");
      gui->AddGuiWindow(mTouchControlsOverlay);
      mTouchControlsOverlay->Show();

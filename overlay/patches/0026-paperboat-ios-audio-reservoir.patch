@@ -2,6 +2,28 @@ Overlay patch 0026 - the audio reservoir is a setting, and the underrun warning 
 
 CLASS: (a) program-baseline parity.
 
+REV 2 (round 26, upstream 1.0.2): ONLY THE RESERVOIR REMAINS.
+Upstream 1.0.2 revived the N64 audio manager thread (`nuAuMgr`, #169): audio is
+produced on its own thread, driven by retrace messages, and handed to SDL through
+`port_aiSetNextBuffer` (`src/port/os/Audio.cpp`). `HandleAudioThread`,
+`StartAudioFrame`/`EndAudioFrame` and the `audio queue underran` warning are gone,
+and so is the game thread's per-tick block on the audio thread that made the
+reservoir a timing budget for VIDEO as well as audio. Part 2 below (the
+rate-limited warning) therefore has nothing left to patch and is dropped; the
+underrun COUNT for the perf harness moved to overlay 0012 rev 8, which samples
+the queue at `port_aiSetNextBuffer`.
+
+Part 1 stays, unchanged in code: `DesiredBuffered` still sets the queue depth
+the revived manager aims for (`port_aiGetLength` reports only the excess over it,
+and the silence pre-roll is sized from it), so `gSohIos.AudioBufferMs` - which
+Settings > iOS exposes (overlay 0021) - keeps doing what users set it to do. The
+90 ms ceiling still holds for a new reason: `osAiGetStatus` reports the FIFO full
+at 6000 queued samples (`kBackendCapacityFrames`), and a target above ~3000 would
+sit too close to it.
+
+(Rev 1 text follows; its description of the game thread blocking on the audio
+thread is history as of upstream 1.0.2.)
+
 WHY
 ---
 The user on 0.0.0.5: "i hear some stuttering every ~5 seconds or so in the audio.
@@ -61,25 +83,24 @@ counter). The CVar is ours - upstream's desktop path does not have the problem.
 
 --- a/src/port/Engine.cpp
 +++ b/src/port/Engine.cpp
-@@ -259,7 +259,37 @@
+@@ -275,7 +275,36 @@
      spdlog::flush_on(spdlog::level::warn);
  #endif
  
 +#ifdef __IOS__
 +    // PAPERBOAT_IOS (overlay 0026): the audio reservoir, in milliseconds.
 +    //
-+    // Upstream's 1680 samples at 32 kHz is 52.5 ms - 1.6 game frames at 30 Hz -
-+    // and the game thread blocks on the audio thread once per frame
-+    // (docs/frame-map.md), so any frame longer than that empties the queue and
-+    // is heard as a click and seen as a hitch at the same instant. 90 ms is
-+    // ~2.7 frames.
++    // Upstream's 1680 samples at 32 kHz is 52.5 ms - 1.6 game frames at 30 Hz.
++    // The revived nuAuMgr thread aims the SDL queue at this depth
++    // (port_aiGetLength reports only the excess over it), so any stall of that
++    // thread longer than the reservoir is an audible click. 90 ms is ~2.7
++    // frames of cover.
 +    //
 +    // 90 is also the CEILING this engine can use, and the clamp is not
-+    // cosmetic: SDLAudioPlayer::DoPlay drops anything queued past 6000 samples,
-+    // and HandleAudioThread stops producing at `Buffered() > 2 * Desired`. With
-+    // Desired above 3000 samples (93.75 ms) that guard sits above the hard
-+    // ceiling, never fires, and the queue parks at 6000 samples of latency with
-+    // nothing to trim it.
++    // cosmetic: SDLAudioPlayer::DoPlay drops anything queued past 6000 samples
++    // and osAiGetStatus reports the FIFO full there (os/Audio.cpp); a target
++    // above ~3000 samples (93.75 ms) leaves the manager no headroom under that
++    // hard ceiling.
 +    //
 +    // Read once, here: changing it needs a relaunch (Settings > iOS says so).
 +    int32_t pbAudioMs = CVarGetInteger("gSohIos.AudioBufferMs", 90);
@@ -99,35 +120,3 @@ counter). The CVar is ours - upstream's desktop path does not have the problem.
  
      // Opt in to texture path memoization.
      if (gsFast3dWindow != nullptr) {
-@@ -1040,7 +1070,31 @@
- 
-             bool accepted = AudioPlayerBuffered() >= before + (frameSamples / 2);
-             if (accepted && before == 0) {
-+#ifdef __IOS__
-+                // PAPERBOAT_IOS (overlay 0026). Two changes, one reason.
-+                //
-+                // Count it: the perf harness's `underruns` field (overlay 0012
-+                // rev2) is what an A/B reads, not a line count in a log file.
-+                //
-+                // Log at most one a second: release builds run an async logger
-+                // with async_overflow_policy::block and flush_on(info) over a
-+                // rotating file sink (ship/Context.cpp), so every warning costs
-+                // THIS thread a queue push and the worker a file flush - while
-+                // the game thread is blocked on this very thread's condition
-+                // variable. A burst of underruns was feeding itself.
-+                PBIos_PerfNoteUnderrun();
-+                {
-+                    static std::chrono::steady_clock::time_point sPbLastUnderrunWarn{};
-+                    const auto pbNow = std::chrono::steady_clock::now();
-+                    if (sPbLastUnderrunWarn.time_since_epoch().count() == 0 ||
-+                        std::chrono::duration<double>(pbNow - sPbLastUnderrunWarn).count() >= 1.0) {
-+                        sPbLastUnderrunWarn = pbNow;
-+                        SPDLOG_WARN("audio queue underran");
-+                    }
-+                }
-+#else
-                 SPDLOG_WARN("audio queue underran");
-+#endif
-             }
-         };
- 

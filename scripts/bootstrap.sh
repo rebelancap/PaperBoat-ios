@@ -11,11 +11,13 @@ VENDOR="$ROOT/vendor/PaperBoat"
 
 # --- D0 pins (see the design notes) ---------------------------------------------
 PB_REPO="https://github.com/HarbourMasters/PaperBoat.git"
-# Upstream 1.0.0 (2026-09-16, "Bump project version to 1.0.0"), tip of develop
-# on the day this port started. LUS is JeodC/libultraship branch lus-converge.
-PB_PIN="5489baad1c08bc134ed894b96cf66c3da615deed"
-LUS_PIN="7aa03b6c830b059e3ddd6ad20d3f289c5f406161"
-TORCH_PIN="106f4e3056f07fe3a8758bb14a060f8423b6877f"
+# Upstream tag 1.0.2 ("Mulberry Charlie 1.0.2"; lightweight tag). Was 1.0.0
+# (5489baad) until round 26. LUS is JeodC/libultraship branch lus-converge;
+# Torch moved from JeodC/Torch-LH (pm64) to HarbourMasters/Torch (main) in
+# upstream d60b803f5, which is why the submodule URLs are re-synced below.
+PB_PIN="b721efd6b5ad6dce9cdef25a6b93b2fdc8b04309"
+LUS_PIN="3e3cd2ed5ac1f85b79b50ec184fb5c09140046c4"
+TORCH_PIN="72960ca16f4723f96aaf4037b76072c230af8c11"
 
 die() { printf '\033[31mFATAL:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -29,6 +31,9 @@ fi
 info "Pinning to D0 commits"
 git -C "$VENDOR" fetch --all --tags --quiet
 git -C "$VENDOR" checkout --quiet "$PB_PIN"
+# A pin bump can change a submodule's URL (.gitmodules); without a sync the
+# existing clone keeps fetching from the old remote and cannot find the commit.
+git -C "$VENDOR" submodule sync --recursive --quiet
 git -C "$VENDOR" submodule update --init --recursive --quiet
 
 assert_pin() {

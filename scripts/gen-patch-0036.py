@@ -111,6 +111,15 @@ coexist and a mid-session flip is safe. Diagnostic only - deliberately NOT in
 Settings > iOS. It exists so a device read can price the change in one line
 instead of two builds.
 
+REV 3 (round 26, upstream 1.0.2): context only. LUS 3e3cd2ed's
+TextureCacheKey grew `indexed = 2` (an HD replacement's silhouette drawn as
+indices, `gDPPaletteMask`) and a `mask[2]` member; `palette_hash` now follows
+`mask[2]`. That new indexed=2 path, like indexed=1, only runs for palettized
+tiles, so with `gSohIos.PaletteInShader` at its default 0 it is not taken. An
+HD pack whose art relies on upstream's run-time-palette mixing may therefore
+draw differently here than on desktop (NOT verified - no official pack exists
+yet); stock assets are unaffected. No code change otherwise.
+
 REV 2 (round 20) - THE RUN-TIME PALETTE RING. The open half of rev 1 turned out
 to be real, and the user's 0.0.0.14 device line named it (M-032 §1):
 
@@ -194,13 +203,19 @@ H_NEW = """    // PAPERBOAT (overlay 0036): GPU palettization is a runtime choic
 # instead of re-decoding an identical palette at a different address.
 H_KEY_OLD = """    // 1 = uploaded as a CI index texture (palette applied in the shader). Indexed
     // entries do not key on palette contents, which is what makes TLUT swaps free.
+    // 2 = the HD replacement's silhouette as indices (see gDPPaletteMask); mask[] are
+    // the entries its opaque and transparent pixels read.
     uint8_t indexed;
+    uint8_t mask[2];
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
 """
 H_KEY_NEW = """    // 1 = uploaded as a CI index texture (palette applied in the shader). Indexed
     // entries do not key on palette contents, which is what makes TLUT swaps free.
+    // 2 = the HD replacement's silhouette as indices (see gDPPaletteMask); mask[] are
+    // the entries its opaque and transparent pixels read.
     uint8_t indexed;
+    uint8_t mask[2];
     // PAPERBOAT (overlay 0036 rev 2): FNV-1a over exactly the TLUT bytes a CPU
     // decode reads (32 for a CI4 bank, 512 for CI8's two halves). Non-zero
     // REPLACES palette_addrs/palette_index in the key for a CPU-decoded CI
