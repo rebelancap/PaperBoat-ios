@@ -52,7 +52,8 @@ finishes.
 ## Texture packs
 
 The port supports Harbour Masters' `.o2r` mods, including texture packs. **MasterKillua's
-official Paper Mario `.o2r` pack is in progress** — when it lands, installing it is:
+official "Paper Mario 64 R" pack is available on his Patreon page in HD and 4K flavours**
+(the HD one is verified on an iPhone with this port). Installing it is:
 
 1. Copy the `.o2r` into *On My iPhone → PaperBoat → **mods*** in the Files app.
 2. Relaunch, then turn **Use Alternate Assets** on in the **Mod Menu** (*Settings → Mod

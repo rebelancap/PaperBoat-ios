@@ -5,6 +5,34 @@ CLASS: (a) program-baseline parity. (Until rev 8 the `PBIosPace` sub-frame
 skip was a class (b) block inside this patch; upstream 1.0.2 ships its own skip
 and rev 8 dropped ours - see below.)
 
+REV 9 (2026-10-09, perf rollout change 1, the design notes D39): REAL-TIME
+SUB-FRAME CATCH-UP (Shipwright 0065 / D-084, adapted). Upstream's skip above
+only fires once the renderer is a WHOLE TICK behind (the next task already
+queued); until then every missed vsync is carried forward as lag, so the
+displayed frames drift a tick or more behind the game (measured on the sim at
+120: key-frame lag 42-44 ms, a steady state upstream's skip never leaves).
+`PBIosPace`'s debt is how late the task's drawing STARTS: submit -> the top
+of RunCommands. On time the main loop is idle when the task lands, so the
+debt is ~1 ms; a renderer that fell behind starts late by exactly its backlog.
+The earliest floor(debt / frame) intermediate sub-frames are dropped (never
+the key frame); a debt over 250 ms is a stall (load, background) and is never
+fast-forwarded through. Phase-free (no pacer metronome in it) and blind to
+ticks the game chose not to draw - the first version keyed on the key-frame
+present interval, as Shipwright does, and every held tick (attract demo,
+transitions) read as a whole tick of debt. ONLY above 60 fps targets: at 120 Hz the VI
+ticker free-runs on the wall clock (present intervals are outside its slave
+window), so game time and music already follow the wall clock and a dropped
+sub-frame costs only an interpolated view; at 60 Hz the VI is SLAVED to
+presents (src/port/os/VI.cpp) and a dropped present would steal a retrace, so
+that path is left to 0025 rev 2's pacer. `gSohIos.TickCatchup` (default 1) is
+the A/B switch; `gSohIos.PaceStressMs` (default 0, test instrument) busy-waits
+that many ms in every frame so the catch-up can be proven on a simulator.
+The task's submit time is stamped in `src/port/Game.cpp`
+(`port_nuGfxOnSubmit`, taken in `ServiceRcp`) so the key frame's LAG
+(submit -> key-frame present) can be measured: that is the number catch-up
+exists to bound. `PBIos_PaceSnapshot()` hands the counters to the PB_PACE
+line (overlay 0041's spike probe).
+
 REV 8 (round 26): RE-HOOKED FOR UPSTREAM 1.0.2's THREADED ENGINE. Upstream
 1.0.2 runs nusys as written on emulated N64 threads (src/port/os/): a VI ticker
 thread raises retraces, `gfxThread` runs `gfxRetrace_Callback` (src/main.c),
@@ -778,6 +806,119 @@ static void DebugPresentDelay() {
 
 } // namespace PBIosStall
 
+// ---------------------------------------------------------------------------
+// PAPERBOAT_IOS (overlay 0012 rev 9, D39) — REAL-TIME SUB-FRAME CATCH-UP.
+// Main (render) thread only, except the submit stamp (atomic, gfx thread).
+// See the patch header for the rule; the counters are cumulative and the
+// PB_PACE line (overlay 0041) takes deltas.
+// ---------------------------------------------------------------------------
+extern "C" std::atomic<long long> gPBIosTaskSubmitNs; // src/port/Game.cpp
+// Interpolated sub-frames per 30 Hz tick (1 at 30 fps, 2 at 60, 4 at 120): the
+// frame period overlay 0041's spike probe classifies against.
+extern "C" volatile int gPBIosSubframesPerTick;
+volatile int gPBIosSubframesPerTick = 2;
+namespace PBIosPace {
+using Clock = std::chrono::steady_clock;
+static constexpr double kTickMs = 1000.0 / 30.0;
+static bool sEnabled = true;
+static int sStressMs = 0;
+static double sDebtMs = 0.0;
+static Clock::time_point sLastKey{};
+// cumulative counters + window extrema (reset by Snapshot)
+static unsigned long long sDropped = 0, sDropTicks = 0, sKeyN = 0;
+static double sDebtSum = 0.0, sDebtMax = 0.0, sLagSum = 0.0, sLagMax = 0.0;
+static double sKeyIntMax = 0.0;
+
+static long long NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+}
+
+static void ReadCVars() {
+    sEnabled = CVarGetInteger("gSohIos.TickCatchup", 1) != 0;
+    const int ms = CVarGetInteger("gSohIos.PaceStressMs", 0);
+    sStressMs = (ms > 0 && ms < 200) ? ms : 0;
+}
+
+// Top of RunCommands: how many of this tick's EARLIEST sub-frames to drop.
+static int DropsForTick(size_t count) {
+    gPBIosSubframesPerTick = (int)count; // the spike probe's frame period
+    if (!sEnabled || count <= 2) {
+        return 0; // <= 60 fps: the VI is slaved to presents (see header)
+    }
+    const double frameMs = kTickMs / (double)count;
+    // The debt is how late THIS task's drawing starts: submit -> now. On time,
+    // the main loop is idle when the task lands and starts within ~1 ms; a
+    // render that fell behind starts it late by exactly the backlog. Phase-free
+    // (no pacer metronome in it) and blind to ticks the game chose not to draw.
+    const long long submit = gPBIosTaskSubmitNs.load(std::memory_order_relaxed);
+    sDebtMs = submit > 0 ? (double)(NowNs() - submit) / 1e6 : 0.0;
+    if (sDebtMs < 0.0 || sDebtMs > 250.0) {
+        sDebtMs = 0.0; // a stall (load, background): never fast-forward through it
+    }
+    sDebtSum += sDebtMs;
+    sDebtMax = std::max(sDebtMax, sDebtMs);
+    int k = (int)(sDebtMs / frameMs);
+    if (k > (int)count - 1) {
+        k = (int)count - 1; // never the key frame
+    }
+    if (k > 0) {
+        sDropped += (unsigned long long)k;
+        sDropTicks++;
+    }
+    return k;
+}
+
+// Test instrument: a deliberately slow frame (inside the measured present).
+static void StressSpin() {
+    if (sStressMs > 0) {
+        const auto until = Clock::now() + std::chrono::milliseconds(sStressMs);
+        while (Clock::now() < until) {
+        }
+    }
+}
+
+// After the KEY frame's present.
+static void OnKeyPresent() {
+    const auto now = Clock::now();
+    const long long submit = gPBIosTaskSubmitNs.load(std::memory_order_relaxed);
+    if (submit > 0) {
+        const double lag = (double)(NowNs() - submit) / 1e6;
+        if (lag >= 0.0 && lag < 1000.0) {
+            sLagSum += lag;
+            sLagMax = std::max(sLagMax, lag);
+        }
+    }
+    if (sLastKey.time_since_epoch().count() != 0) {
+        const double el = std::chrono::duration<double, std::milli>(now - sLastKey).count();
+        sKeyIntMax = std::max(sKeyIntMax, el);
+    }
+    sLastKey = now;
+    sKeyN++;
+}
+
+} // namespace PBIosPace
+
+// For the PB_PACE line (overlay 0041). Cumulative drop/key counters; the sums
+// and maxima cover the window since the previous call and are reset by it.
+extern "C" void PBIos_PaceSnapshot(unsigned long long* dropped, unsigned long long* dropTicks,
+                                   unsigned long long* keys, double* debtSum, double* debtMax, double* lagSum,
+                                   double* lagMax, double* keyIntMax, int* enabled, int* stressMs,
+                                   unsigned int* upstreamSkips) {
+    *dropped = PBIosPace::sDropped;
+    *dropTicks = PBIosPace::sDropTicks;
+    *keys = PBIosPace::sKeyN;
+    *debtSum = PBIosPace::sDebtSum;
+    *debtMax = PBIosPace::sDebtMax;
+    *lagSum = PBIosPace::sLagSum;
+    *lagMax = PBIosPace::sLagMax;
+    *keyIntMax = PBIosPace::sKeyIntMax;
+    *enabled = PBIosPace::sEnabled ? 1 : 0;
+    *stressMs = PBIosPace::sStressMs;
+    *upstreamSkips = PBIosPerf::gProbe.subSkips.load();
+    PBIosPace::sDebtSum = PBIosPace::sDebtMax = PBIosPace::sLagSum = PBIosPace::sLagMax = 0.0;
+    PBIosPace::sKeyIntMax = 0.0;
+}
+
 // The console bridge's `fps` verb (app/ios/PaperBoatIosShell.m ->
 // docs/console-bridge.md). Returns the length written.
 extern "C" int PBIos_PerfReport(char* out, int cap) {
@@ -858,7 +999,20 @@ ENGINE_FRAME_OLD = """    for (size_t i = 0; i < mtx_replacements.size(); i++) {
         interpreter->mInterpolationIndex++;
     }
 """
-ENGINE_FRAME_NEW = """    for (size_t i = 0; i < mtx_replacements.size(); i++) {
+ENGINE_FRAME_NEW = """#ifdef __IOS__
+    // PAPERBOAT_IOS (overlay 0012 rev 9, D39): real-time catch-up - drop this
+    // tick's EARLIEST sub-frames while the key frames run a frame or more
+    // behind the wall clock (above 60 fps only; see PBIosPace).
+    PBIosPace::ReadCVars();
+    const int pbCatchupDrops = PBIosPace::DropsForTick(mtx_replacements.size());
+#endif
+    for (size_t i = 0; i < mtx_replacements.size(); i++) {
+#ifdef __IOS__
+        if ((int)i < pbCatchupDrops) {
+            interpreter->mInterpolationIndex++;
+            continue;
+        }
+#endif
         // The game has queued its next frame, so we're behind: skip to this frame's last draw
         // rather than leaving the game to skip drawing a whole frame.
         if (i + 1 < mtx_replacements.size() && nuGfxTaskSpool >= 2) {
@@ -876,9 +1030,13 @@ ENGINE_FRAME_NEW = """    for (size_t i = 0; i < mtx_replacements.size(); i++) {
 #endif
         wnd->DrawAndRunGraphicsCommands(Commands, mtx_replacements[i], {});
 #ifdef __IOS__
+        PBIosPace::StressSpin();
         PBIosStall::DebugPresentDelay();
         PBIosPerf::gProbe.OnFrame(
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pbPerfT0).count());
+        if (i + 1 == mtx_replacements.size()) {
+            PBIosPace::OnKeyPresent(); // rev 9: the key frame is on screen
+        }
 #endif
         OS_ViNotifyPresent();
         interpreter->mInterpolationIndex++;
@@ -1183,6 +1341,62 @@ LOOP_HOLD_NEW = """    if (gOverrideFlags & GLOBAL_OVERRIDES_DISABLE_DRAW_FRAME)
 """
 
 EDITS.append(("src/main_loop.c", [(LOOP_DECL_OLD, LOOP_DECL_NEW, 1), (LOOP_HOLD_OLD, LOOP_HOLD_NEW, 1)]))
+
+# Rev 9: the task's submit time, for the key-frame lag (PBIosPace).
+GAME_STRUCT_OLD = """struct InterpPair {
+    int prev = -1;
+    int curr = -1;
+    bool should = false;
+    bool capturePrevFrame = true;
+};
+"""
+GAME_STRUCT_NEW = """struct InterpPair {
+    int prev = -1;
+    int curr = -1;
+    bool should = false;
+    bool capturePrevFrame = true;
+#ifdef __IOS__
+    long long submitNs = 0; // PAPERBOAT_IOS (overlay 0012 rev 9): steady_clock at submit
+#endif
+};
+"""
+GAME_TAKE_OLD = """    const uint32_t flags = Graphics_TaskFlags(nuTask);
+    InterpPair pair = TakePair(nuTask);
+    Gfx* list = (Gfx*) task->t.data_ptr;
+"""
+GAME_TAKE_NEW = """    const uint32_t flags = Graphics_TaskFlags(nuTask);
+    InterpPair pair = TakePair(nuTask);
+    Gfx* list = (Gfx*) task->t.data_ptr;
+#ifdef __IOS__
+    // PAPERBOAT_IOS (overlay 0012 rev 9): the task being drawn was submitted at
+    // this time; RunCommands measures the key frame's lag against it.
+    if ((flags & NU_SC_SWAPBUFFER) && pair.submitNs > 0) {
+        gPBIosTaskSubmitNs.store(pair.submitNs, std::memory_order_relaxed);
+    }
+#endif
+"""
+GAME_SUBMIT_OLD = """    pair.capturePrevFrame = Graphics_ShouldCapturePrevFrame() != 0;
+"""
+GAME_SUBMIT_NEW = """    pair.capturePrevFrame = Graphics_ShouldCapturePrevFrame() != 0;
+#ifdef __IOS__
+    pair.submitNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+#endif
+"""
+GAME_GLOBAL_OLD = """#define NU_SC_SWAPBUFFER 0x0001 /* nusys.h */
+"""
+GAME_GLOBAL_NEW = """#define NU_SC_SWAPBUFFER 0x0001 /* nusys.h */
+
+#ifdef __IOS__
+// PAPERBOAT_IOS (overlay 0012 rev 9): submit time of the swap task being drawn.
+#include <atomic>
+extern "C" std::atomic<long long> gPBIosTaskSubmitNs;
+std::atomic<long long> gPBIosTaskSubmitNs{ 0 };
+#endif
+"""
+EDITS.append(("src/port/Game.cpp", [(GAME_GLOBAL_OLD, GAME_GLOBAL_NEW, 1), (GAME_STRUCT_OLD, GAME_STRUCT_NEW, 1),
+                                    (GAME_TAKE_OLD, GAME_TAKE_NEW, 1), (GAME_SUBMIT_OLD, GAME_SUBMIT_NEW, 1)]))
 
 chunks = []
 for rel, subs in EDITS:

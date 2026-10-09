@@ -65,7 +65,7 @@ if [ "$SIGNING" = "ON" ]; then
     ISSUER_ID="${PAPERBOAT_ASC_ISSUER_ID:-}"
     AUTH=(-allowProvisioningUpdates)
     if [ -n "$KEY_ID" ] && [ -n "$ISSUER_ID" ]; then
-        KEY_PATH="${PAPERBOAT_ASC_KEY_PATH:-$HOME/.appstoreconnect/private_keys/AuthKey_${KEY_ID}.p8}"
+        KEY_PATH="${PAPERBOAT_ASC_KEY_PATH:?set PAPERBOAT_ASC_KEY_PATH to your App Store Connect API key file}"
         [ -f "$KEY_PATH" ] || die "App Store Connect key missing at $KEY_PATH"
         AUTH+=(-authenticationKeyPath "$KEY_PATH"
                -authenticationKeyID "$KEY_ID"
@@ -115,8 +115,17 @@ PLIST
     xcodebuild -exportArchive -archivePath "$BUILD/PaperboatRelease.xcarchive" \
         -exportPath "$STAGE" -exportOptionsPlist "$BUILD/export-release.plist" \
         "${AUTH[@]}" | tail -3
-    IPA="$(ls "$STAGE"/*.ipa 2>/dev/null | head -1)"
-    [ -f "$IPA" ] || die "no IPA produced by -exportArchive"
+    # Shipwright 8c1f276: never `ls | head -1`. A leftover IPA that sorts first
+    # once shipped an old, crashing binary under a new version label. Exactly one
+    # IPA, or nothing goes out (the version check below is the other half).
+    shopt -s nullglob
+    _ipas=("$STAGE"/*.ipa)
+    shopt -u nullglob
+    if [ "${#_ipas[@]}" -ne 1 ]; then
+        printf '  %s\n' "${_ipas[@]}" >&2
+        die "expected exactly 1 IPA in $STAGE, found ${#_ipas[@]} — remove the stale one(s) and re-run"
+    fi
+    IPA="${_ipas[0]}"
 
     # SYNC WAVE 2 trap, and it bites here too: `xcodebuild archive` replaces
     # build-ios/Release-iphoneos/Paperboat.app with a symlink into

@@ -1,0 +1,822 @@
+Overlay patch 0041 - spike attribution probe + PB_PACE line (iOS only).
+
+CLASS: (a) program-baseline parity (the perf rollout of 2026-10-09; Shipwright
+0065's SOH_PACE + 0066/0068's spike probe and menu split, D-084/D-085/D-087).
+The design notes D40.
+
+WHAT. A new file, src/port/ios/PBIosSpikeProbe.cpp (source of truth:
+overlay/files/PBIosSpikeProbe.cpp; picked up by upstream's GLOB_RECURSE of
+src/*.cpp, and #ifdef __IOS__ throughout), plus the seams that feed it:
+
+  Fast3dWindow.cpp   frame begin (after the visibility check), marks after
+                     Gui::StartDraw / Interpreter::Run / Gui::EndDraw, frame end
+                     after Interpreter::EndFrame; HandleEvents -> `ev`
+  gfx_metal.cpp      SetupScreenFramebuffer inside NewFrame -> `wait`;
+                     ReadFramebufferToCPU -> `fbrd`
+  gfx_sdl2.cpp       SyncFramerateWithTime inside SwapBuffersBegin -> `sleep`
+  Gui.cpp            the menu-phase split (StartFrame: nf/wm/ig; DrawMenu:
+                     dock/bar/menu/win, every GuiWindow timed by name);
+                     CheckSaveCvars -> `cvsave`
+  SDLAddRemoveDeviceEventHandler.cpp   its per-frame SDL_PumpEvents -> `pump`
+  ResourceManager.cpp  a cache-miss wait in LoadResource -> `res`
+  Game.cpp           OS_SiService -> `si`; the no-task SDL_Delay(1) -> `idle`
+
+Output lines PB_PACE / PB_SPKWIN / PB_SPIKE / PB_MENUWIN every 10 s (formats
+in the file header and the measurement log M-039). `gSohIos.SpikeProbe` (default 1)
+switches it off. Reads overlay 0012 rev 9's PBIos_PaceSnapshot and
+gPBIosSubframesPerTick, and the shell's PBIos_ThermalState/PBIos_PowerState.
+
+NO GetPixelDepth: PM64 never calls it (grep of src/ and the LUS fork), so
+Shipwright's change 3 (async depth + PSO cache, 0067) does not apply; the only
+GPU->CPU read is the flame effect's gDPReadFBToI8, timed here as `fbrd` (D41).
+
+Generate against the vendor tree with 0001..0040 applied and 0041 not applied.
+Every hunk keeps clear of earlier patches' hunks and their 3-line contexts
+(apply-overlay.sh's already-applied probe proves it on every build).
+
+--- /dev/null
++++ b/src/port/ios/PBIosSpikeProbe.cpp
+@@ -0,0 +1,432 @@
++// PAPERBOAT_IOS (overlay 0041, D40): SPIKE ATTRIBUTION PROBE + PACE LINE.
++// Port of Shipwright 0065's SOH_PACE + 0066/0068's spike probe and menu split
++// (D-084/D-085/D-087) to PaperBoat's threaded engine. iOS only; the whole file
++// compiles to nothing elsewhere. Source of truth: overlay/files/PBIosSpikeProbe.cpp.
++//
++// THE FRAME (main thread = the render loop on iOS; the game ticks on the nusys
++// gfx thread, so a slow TICK shows up here as a late task, not a long frame):
++//   gap    previous frame's end -> this frame's DrawAndRunGraphicsCommands.
++//          Holds the main loop: waiting for the next task (idle, NOT cpu),
++//          OS_SiService (si: controller read incl. an SDL pump), ServiceRcp,
++//          FrameInterpolation, RunCommands' HandleEvents pump (ev).
++//   wait   nextDrawable (SetupScreenFramebuffer inside Metal NewFrame).
++//   menu   Gui::StartDraw minus wait: ImGui NewFrame + DrawMenu (every
++//          GuiWindow's Update, incl. LUS's SDLAddRemoveDeviceEventHandler
++//          SDL_PumpEvents = the UIKit run loop = the touch overlay) + viewport.
++//   run    Interpreter::StartFrame + Run (the display list).
++//   gui    Gui::EndDraw (DrawGame, ImGui render, floating windows, cvar save).
++//   end    Interpreter::EndFrame minus the pacer sleep (commit, present).
++//   sleep  LUS's SyncFramerateWithTime nanosleep pacer.
++//   cpu    (gap - idle) + menu + run + gui + end. cpu > the frame period
++//          (1000 / (30 * sub-frames per tick)) is a SPIKE.
++// Seam categories (main thread only, ms + count, also inside spike frames):
++//   0 res    ResourceManager::LoadResource cache MISS waited on (pool load)
++//   1 fbrd   GfxRenderingAPIMetal::ReadFramebufferToCPU (the flame effect's
++//            readback; PM64's only GPU->CPU read - there is no GetPixelDepth)
++//   2 ev     Fast3dWindow::HandleEvents (SDL pump in RunCommands, once a tick)
++//   3 pump   SDLAddRemoveDeviceEventHandler::UpdateElement's SDL_PumpEvents
++//            (every frame, inside `menu`)
++//   4 si     OS_SiService (controller read; ControlDeck pumps SDL too)
++//   5 cvsave Gui::CheckSaveCvars -> ConsoleVariables::Save
++//   6 idle   main loop SDL_Delay(1) while no task is pending (not cpu)
++//
++// OUTPUT (spdlog -> the log file the user's device pull reads), every 10 s:
++//   PB_PACE    key-frame cadence + the 0012 rev 9 catch-up counters (late =
++//              task submit -> its drawing starts), frame
++//              wait/busy/sleep percentiles, thermal + power state
++//   PB_SPKWIN  frames, spikes, cpu p50/p95/max, per-frame split averages over
++//              all frames / spike frames, every category n/ms/ms-in-spikes
++//   PB_SPIKE   one line per spike frame (max 20 per window, rest counted)
++//   PB_MENUWIN the `menu` phase split into eight buckets, wall + thread-cpu,
++//              plus the three costliest GuiWindows by name
++// gSohIos.SpikeProbe (default 1, re-read every 60 frames) switches it off.
++
++#ifdef __IOS__
++
++#include <libultraship.h>
++
++#include <mach/mach_time.h>
++#include <pthread.h>
++#include <time.h>
++
++#include <algorithm>
++#include <atomic>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++extern "C" {
++int PBIos_ThermalState(void);
++int PBIos_PowerState(void); // shell: 1 LPM, 2 charging, 4 full, 8 unknown
++extern volatile int gPBIosSubframesPerTick; // overlay 0012 rev 9
++void PBIos_PaceSnapshot(unsigned long long* dropped, unsigned long long* dropTicks, unsigned long long* keys,
++                        double* debtSum, double* debtMax, double* lagSum, double* lagMax, double* keyIntMax,
++                        int* enabled, int* stressMs, unsigned int* upstreamSkips);
++}
++
++namespace {
++
++constexpr int kCats = 7;
++const char* const kCatName[kCats] = { "res", "fbrd", "ev", "pump", "si", "cvsave", "idle" };
++constexpr int kIdleCat = 6;
++constexpr int kMenuBuckets = 8;
++const char* const kMenuName[kMenuBuckets] = { "nf", "wm", "ig", "dock", "bar", "menu", "win", "vp" };
++constexpr double kWindowS = 10.0;
++constexpr int kMaxSpikeLines = 20;
++
++double gTickToMs = 0.0;
++bool gEnabled = true;
++int gFramesSinceCVar = 0;
++
++double TicksToMs(uint64_t t) {
++    if (gTickToMs == 0.0) {
++        mach_timebase_info_data_t tb;
++        mach_timebase_info(&tb);
++        gTickToMs = (double)tb.numer / (double)tb.denom / 1e6;
++    }
++    return (double)t * gTickToMs;
++}
++
++double ThreadCpuMs() {
++    timespec ts;
++    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
++    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++}
++
++struct SpkFrame {
++    uint64_t begin = 0, drawB = 0, drawE = 0, mark[3] = { 0, 0, 0 }, sleepB = 0, sleepE = 0;
++    double catMs[kCats] = {};
++    uint32_t catN[kCats] = {};
++    double menuMs[kMenuBuckets] = {};
++    double menuCpu[kMenuBuckets] = {};
++};
++
++struct SpkWindow {
++    std::vector<double> cpu, wait, busy, sleep;
++    uint32_t frames = 0, spikes = 0, spikeLinesDropped = 0, spikeLines = 0;
++    double splitAll[7] = {}, splitSpk[7] = {}; // gap idle wait menu run gui end
++    double catMs[kCats] = {}, catSpkMs[kCats] = {};
++    uint32_t catN[kCats] = {};
++    double menuMs[kMenuBuckets] = {}, menuCpu[kMenuBuckets] = {}, menuMax = 0.0;
++    struct Win {
++        std::string name;
++        double ms = 0.0, max = 0.0;
++        uint32_t n = 0;
++    };
++    std::vector<Win> wins;
++    uint64_t start = 0;
++    unsigned long long lastDropped = 0, lastDropTicks = 0, lastKeys = 0;
++    unsigned int lastUpSkips = 0;
++};
++
++SpkFrame gFrame;
++SpkWindow gWin;
++uint64_t gPrevEnd = 0;
++bool gInFrame = false;
++uint64_t gMenuLast = 0;
++double gMenuCpuLast = 0.0;
++uint64_t gWinT0 = 0;
++
++bool OnMain() {
++    return pthread_main_np() != 0;
++}
++
++double Pct(std::vector<double>& v, double p) {
++    if (v.empty()) {
++        return 0.0;
++    }
++    return v[(size_t)(p * (double)(v.size() - 1))];
++}
++
++void Flush(uint64_t now) {
++    const double el = TicksToMs(now - gWin.start) / 1000.0;
++    if (gWin.start == 0) {
++        gWin.start = now;
++        return;
++    }
++    if (el < kWindowS || gWin.frames < 8) {
++        return;
++    }
++    for (auto* v : { &gWin.cpu, &gWin.wait, &gWin.busy, &gWin.sleep }) {
++        std::sort(v->begin(), v->end());
++    }
++    const double n = (double)gWin.frames;
++    const double ns = gWin.spikes > 0 ? (double)gWin.spikes : 1.0;
++
++    // PB_PACE: key-frame cadence + catch-up (0012 rev 9), frame split percentiles.
++    unsigned long long dropped = 0, dropTicks = 0, keys = 0;
++    double debtSum = 0, debtMax = 0, lagSum = 0, lagMax = 0, keyIntMax = 0;
++    int enabled = 0, stress = 0;
++    unsigned int upSkips = 0;
++    PBIos_PaceSnapshot(&dropped, &dropTicks, &keys, &debtSum, &debtMax, &lagSum, &lagMax, &keyIntMax, &enabled,
++                       &stress, &upSkips);
++    const unsigned long long dKeys = keys - gWin.lastKeys;
++    const double kn = dKeys > 0 ? (double)dKeys : 1.0;
++    SPDLOG_INFO("PB_PACE tps={:.2f} keys={} ipf={} fps={:.1f} key_int_max={:.1f} lag_avg={:.2f} lag_max={:.2f} "
++                "dropped={} drop_ticks={} upstream_skips={} late_avg={:.2f} late_max={:.2f} "
++                "wait_ms p50={:.2f} p95={:.2f} max={:.2f} busy_ms p50={:.2f} p95={:.2f} max={:.2f} "
++                "sleep_ms p50={:.2f} p95={:.2f} catchup={} stress={} thermal={} power={}",
++                dKeys / el, dKeys, (int)gPBIosSubframesPerTick, n / el, keyIntMax, lagSum / kn, lagMax,
++                dropped - gWin.lastDropped, dropTicks - gWin.lastDropTicks, upSkips - gWin.lastUpSkips,
++                debtSum / kn, debtMax, Pct(gWin.wait, 0.5), Pct(gWin.wait, 0.95),
++                gWin.wait.empty() ? 0.0 : gWin.wait.back(), Pct(gWin.busy, 0.5), Pct(gWin.busy, 0.95),
++                gWin.busy.empty() ? 0.0 : gWin.busy.back(), Pct(gWin.sleep, 0.5), Pct(gWin.sleep, 0.95), enabled,
++                stress, PBIos_ThermalState(), PBIos_PowerState());
++
++    // PB_SPKWIN
++    char cats[640];
++    int off = 0;
++    for (int c = 0; c < kCats; c++) {
++        off += snprintf(cats + off, sizeof(cats) - off, " %s=%u/%.1f/%.1f", kCatName[c], gWin.catN[c], gWin.catMs[c],
++                        gWin.catSpkMs[c]);
++        if (off >= (int)sizeof(cats)) {
++            break;
++        }
++    }
++    SPDLOG_INFO("PB_SPKWIN s={:.1f} frames={} spikes={} spike_lines_dropped={} period_ms={:.2f} cpu_ms p50={:.2f} "
++                "p95={:.2f} max={:.2f} all(gap/idle/wait/menu/run/gui/end)={:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/"
++                "{:.2f} spk={:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f} cats(n/ms/spk_ms):{} thermal={}",
++                el, gWin.frames, gWin.spikes, gWin.spikeLinesDropped,
++                1000.0 / (30.0 * std::max(1, (int)gPBIosSubframesPerTick)), Pct(gWin.cpu, 0.5),
++                Pct(gWin.cpu, 0.95), gWin.cpu.empty() ? 0.0 : gWin.cpu.back(), gWin.splitAll[0] / n,
++                gWin.splitAll[1] / n, gWin.splitAll[2] / n, gWin.splitAll[3] / n, gWin.splitAll[4] / n,
++                gWin.splitAll[5] / n, gWin.splitAll[6] / n, gWin.splitSpk[0] / ns, gWin.splitSpk[1] / ns,
++                gWin.splitSpk[2] / ns, gWin.splitSpk[3] / ns, gWin.splitSpk[4] / ns, gWin.splitSpk[5] / ns,
++                gWin.splitSpk[6] / ns, cats, PBIos_ThermalState());
++
++    // PB_MENUWIN
++    char mb[512];
++    off = 0;
++    for (int b = 0; b < kMenuBuckets; b++) {
++        off += snprintf(mb + off, sizeof(mb) - off, " %s=%.1f/%.1f", kMenuName[b], gWin.menuMs[b], gWin.menuCpu[b]);
++        if (off >= (int)sizeof(mb)) {
++            break;
++        }
++    }
++    std::sort(gWin.wins.begin(), gWin.wins.end(), [](const SpkWindow::Win& a, const SpkWindow::Win& b) { return a.ms > b.ms; });
++    char top[384];
++    off = 0;
++    top[0] = 0;
++    for (size_t i = 0; i < gWin.wins.size() && i < 3; i++) {
++        off += snprintf(top + off, sizeof(top) - off, " %s:%u/%.1f/max%.2f", gWin.wins[i].name.c_str(), gWin.wins[i].n,
++                        gWin.wins[i].ms, gWin.wins[i].max);
++        if (off >= (int)sizeof(top)) {
++            break;
++        }
++    }
++    SPDLOG_INFO("PB_MENUWIN s={:.1f} frames={} menu_max={:.2f} buckets(wall/cpu ms):{} top_windows(n/ms):{}", el,
++                gWin.frames, gWin.menuMax, mb, top);
++
++    const unsigned long long keepDropped = dropped, keepDropTicks = dropTicks, keepKeys = keys;
++    const unsigned int keepUp = upSkips;
++    gWin = SpkWindow();
++    gWin.start = now;
++    gWin.lastDropped = keepDropped;
++    gWin.lastDropTicks = keepDropTicks;
++    gWin.lastKeys = keepKeys;
++    gWin.lastUpSkips = keepUp;
++}
++
++} // namespace
++
++extern "C" unsigned long long PBIos_SpkNow(void) {
++    if (!gEnabled || !OnMain()) {
++        return 0;
++    }
++    return mach_absolute_time();
++}
++
++extern "C" void PBIos_SpkAdd(int cat, unsigned long long t0) {
++    if (t0 == 0 || cat < 0 || cat >= kCats) {
++        return;
++    }
++    const double ms = TicksToMs(mach_absolute_time() - t0);
++    gFrame.catMs[cat] += ms;
++    gFrame.catN[cat]++;
++}
++
++// Fast3dWindow::DrawAndRunGraphicsCommands, after its visibility check.
++extern "C" void PBIos_SpkFrameBegin(void) {
++    if (++gFramesSinceCVar >= 60) {
++        gFramesSinceCVar = 0;
++        gEnabled = CVarGetInteger("gSohIos.SpikeProbe", 1) != 0;
++    }
++    if (!gEnabled) {
++        gInFrame = false;
++        return;
++    }
++    const uint64_t now = mach_absolute_time();
++    gFrame.begin = now;
++    gFrame.drawB = gFrame.drawE = gFrame.sleepB = gFrame.sleepE = 0;
++    gFrame.mark[0] = gFrame.mark[1] = gFrame.mark[2] = 0;
++    gMenuLast = now;
++    gMenuCpuLast = ThreadCpuMs();
++    gInFrame = true;
++}
++
++// Menu-phase split (Gui::StartFrame / Gui::DrawMenu): the time since the
++// previous mark goes to `bucket`.
++extern "C" void PBIos_MenuMark(int bucket) {
++    if (!gInFrame || bucket < 0 || bucket >= kMenuBuckets) {
++        return;
++    }
++    const uint64_t now = mach_absolute_time();
++    const double cpu = ThreadCpuMs();
++    gFrame.menuMs[bucket] += TicksToMs(now - gMenuLast);
++    gFrame.menuCpu[bucket] += cpu - gMenuCpuLast;
++    gMenuLast = now;
++    gMenuCpuLast = cpu;
++}
++
++extern "C" void PBIos_MenuWinBegin(void) {
++    gWinT0 = gInFrame ? mach_absolute_time() : 0;
++}
++
++extern "C" void PBIos_MenuWinEnd(const char* name) {
++    if (gWinT0 == 0 || name == nullptr) {
++        return;
++    }
++    const double ms = TicksToMs(mach_absolute_time() - gWinT0);
++    gWinT0 = 0;
++    for (auto& w : gWin.wins) {
++        if (w.name == name) {
++            w.ms += ms;
++            w.max = std::max(w.max, ms);
++            w.n++;
++            return;
++        }
++    }
++    gWin.wins.push_back({ name, ms, ms, 1 });
++}
++
++extern "C" void PBIos_PaceDrawableBegin(void) {
++    if (gInFrame) {
++        gFrame.drawB = mach_absolute_time();
++    }
++}
++
++extern "C" void PBIos_PaceDrawableEnd(void) {
++    if (gInFrame) {
++        gFrame.drawE = mach_absolute_time();
++    }
++}
++
++extern "C" void PBIos_PaceSleepBegin(void) {
++    if (gInFrame) {
++        gFrame.sleepB = mach_absolute_time();
++    }
++}
++
++extern "C" void PBIos_PaceSleepEnd(void) {
++    if (gInFrame) {
++        gFrame.sleepE = mach_absolute_time();
++    }
++}
++
++// 0 = Gui::StartDraw returned, 1 = Interpreter::Run returned, 2 = Gui::EndDraw returned.
++extern "C" void PBIos_SpkMark(int which) {
++    if (!gInFrame || which < 0 || which > 2) {
++        return;
++    }
++    gFrame.mark[which] = mach_absolute_time();
++    if (which == 0) {
++        PBIos_MenuMark(7); // vp: last DrawMenu mark -> StartDraw returned
++    }
++}
++
++// After Interpreter::EndFrame (present + pacer sleep).
++extern "C" void PBIos_SpkFrameEnd(void) {
++    if (!gInFrame) {
++        return;
++    }
++    gInFrame = false;
++    const uint64_t now = mach_absolute_time();
++    SpkFrame& f = gFrame;
++    if (f.mark[0] == 0 || f.mark[1] == 0 || f.mark[2] == 0) {
++        gPrevEnd = now;
++        gFrame = SpkFrame();
++        return;
++    }
++    const double gap = gPrevEnd != 0 ? TicksToMs(f.begin - gPrevEnd) : 0.0;
++    const double idle = std::min(gap, f.catMs[kIdleCat]);
++    const double wait = (f.drawB != 0 && f.drawE >= f.drawB) ? TicksToMs(f.drawE - f.drawB) : 0.0;
++    const double sleep = (f.sleepB != 0 && f.sleepE >= f.sleepB) ? TicksToMs(f.sleepE - f.sleepB) : 0.0;
++    const double menu = std::max(0.0, TicksToMs(f.mark[0] - f.begin) - wait);
++    const double run = TicksToMs(f.mark[1] - f.mark[0]);
++    const double gui = TicksToMs(f.mark[2] - f.mark[1]);
++    const double end = std::max(0.0, TicksToMs(now - f.mark[2]) - sleep);
++    const double cpu = (gap - idle) + menu + run + gui + end;
++    const double busy = menu + run + gui + end;
++    const double period = 1000.0 / (30.0 * std::max(1, (int)gPBIosSubframesPerTick));
++    const bool spike = cpu > period;
++    // `nf` holds the drawable wait (it happens inside the backend NewFrame); take it out.
++    f.menuMs[0] = std::max(0.0, f.menuMs[0] - wait);
++
++    gWin.frames++;
++    gWin.cpu.push_back(cpu);
++    gWin.wait.push_back(wait);
++    gWin.busy.push_back(busy);
++    gWin.sleep.push_back(sleep);
++    const double split[7] = { gap - idle, idle, wait, menu, run, gui, end };
++    for (int i = 0; i < 7; i++) {
++        gWin.splitAll[i] += split[i];
++        if (spike) {
++            gWin.splitSpk[i] += split[i];
++        }
++    }
++    for (int c = 0; c < kCats; c++) {
++        gWin.catMs[c] += f.catMs[c];
++        gWin.catN[c] += f.catN[c];
++        if (spike) {
++            gWin.catSpkMs[c] += f.catMs[c];
++        }
++    }
++    double menuTotal = 0.0;
++    for (int b = 0; b < kMenuBuckets; b++) {
++        gWin.menuMs[b] += f.menuMs[b];
++        gWin.menuCpu[b] += f.menuCpu[b];
++        menuTotal += f.menuMs[b];
++    }
++    gWin.menuMax = std::max(gWin.menuMax, menuTotal);
++    if (spike) {
++        gWin.spikes++;
++        if (gWin.spikeLines < kMaxSpikeLines) {
++            gWin.spikeLines++;
++            char cats[384];
++            int off = 0;
++            cats[0] = 0;
++            for (int c = 0; c < kCats; c++) {
++                if (f.catN[c] > 0) {
++                    off += snprintf(cats + off, sizeof(cats) - off, " %s=%u/%.2f", kCatName[c], f.catN[c], f.catMs[c]);
++                    if (off >= (int)sizeof(cats)) {
++                        break;
++                    }
++                }
++            }
++            char mb[384];
++            off = 0;
++            mb[0] = 0;
++            for (int b = 0; b < kMenuBuckets; b++) {
++                if (f.menuMs[b] >= 0.5) {
++                    off += snprintf(mb + off, sizeof(mb) - off, " %s=%.2f/%.2f", kMenuName[b], f.menuMs[b], f.menuCpu[b]);
++                    if (off >= (int)sizeof(mb)) {
++                        break;
++                    }
++                }
++            }
++            SPDLOG_INFO("PB_SPIKE cpu={:.2f} period={:.2f} gap={:.2f} idle={:.2f} wait={:.2f} menu={:.2f} run={:.2f} "
++                        "gui={:.2f} end={:.2f} sleep={:.2f}{} menu_split:{}",
++                        cpu, period, gap - idle, idle, wait, menu, run, gui, end, sleep, cats, mb);
++        } else {
++            gWin.spikeLinesDropped++;
++        }
++    }
++    gPrevEnd = now;
++    gFrame = SpkFrame();
++    Flush(now);
++}
++
++#endif // __IOS__
+--- a/external/libultraship/src/fast/Fast3dWindow.cpp
++++ b/external/libultraship/src/fast/Fast3dWindow.cpp
+@@ -206,6 +206,19 @@
+     return mWindowManagerApi->IsFrameReady();
+ }
+ 
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0041, D40): spike probe seams; the probe lives in
++// src/port/ios/PBIosSpikeProbe.cpp. PBIos_SpkNow returns 0 while the probe is
++// off or off the main thread, and PBIos_SpkAdd ignores a 0 start.
++extern "C" unsigned long long PBIos_SpkNow(void);
++extern "C" void PBIos_SpkAdd(int cat, unsigned long long t0);
++#endif
++#ifdef __IOS__
++extern "C" void PBIos_SpkFrameBegin(void);
++extern "C" void PBIos_SpkMark(int which);
++extern "C" void PBIos_SpkFrameEnd(void);
++#endif
++
+ bool Fast3dWindow::DrawAndRunGraphicsCommands(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements,
+                                               const std::unordered_map<Gfx*, Gfx*>& dlReplacements) {
+     std::shared_ptr<Window> wnd = Ship::Context::GetRawInstance()->GetWindow();
+@@ -225,25 +238,46 @@
+         return false;
+     }
+ 
++#ifdef __IOS__
++    PBIos_SpkFrameBegin(); // overlay 0041
++#endif
+     auto gui = wnd->GetGui();
+     // Setup mouse state manager
+     wnd->GetMouseStateManager()->StartFrame();
+     // Setup of the backend frames and draw initial Window and GUI menus
+     gui->StartDraw();
++#ifdef __IOS__
++    PBIos_SpkMark(0);
++#endif
+     // Setup game framebuffers to match available window space
+     mInterpreter->StartFrame();
+     // Execute the games gfx commands
+     mInterpreter->Run(commands, mtxReplacements, dlReplacements);
++#ifdef __IOS__
++    PBIos_SpkMark(1);
++#endif
+     // Renders the game frame buffer to the final window and finishes the GUI
+     gui->EndDraw();
++#ifdef __IOS__
++    PBIos_SpkMark(2);
++#endif
+     // Finalize swap buffers
+     mInterpreter->EndFrame();
++#ifdef __IOS__
++    PBIos_SpkFrameEnd(); // after the present and LUS's pacing sleep
++#endif
+ 
+     return true;
+ }
+ 
+ void Fast3dWindow::HandleEvents() {
++#ifdef __IOS__
++    const unsigned long long pbSpkT0 = PBIos_SpkNow(); // overlay 0041: `ev`
++#endif
+     mWindowManagerApi->HandleEvents();
++#ifdef __IOS__
++    PBIos_SpkAdd(2, pbSpkT0);
++#endif
+ }
+ 
+ void Fast3dWindow::SetCursorVisibility(bool visible) {
+--- a/external/libultraship/src/fast/backends/gfx_metal.cpp
++++ b/external/libultraship/src/fast/backends/gfx_metal.cpp
+@@ -137,10 +137,28 @@
+ 
+ static void SetupScreenFramebuffer(uint32_t width, uint32_t height);
+ 
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0041, D40): spike probe seams; the probe lives in
++// src/port/ios/PBIosSpikeProbe.cpp. PBIos_SpkNow returns 0 while the probe is
++// off or off the main thread, and PBIos_SpkAdd ignores a 0 start.
++extern "C" unsigned long long PBIos_SpkNow(void);
++extern "C" void PBIos_SpkAdd(int cat, unsigned long long t0);
++#endif
++#ifdef __IOS__
++extern "C" void PBIos_PaceDrawableBegin(void);
++extern "C" void PBIos_PaceDrawableEnd(void);
++#endif
++
+ void GfxRenderingAPIMetal::NewFrame() {
+     int width, height;
+     SDL_GetRendererOutputSize(mRenderer, &width, &height);
++#ifdef __IOS__
++    PBIos_PaceDrawableBegin(); // overlay 0041: `wait` (nextDrawable)
++#endif
+     SetupScreenFramebuffer(width, height);
++#ifdef __IOS__
++    PBIos_PaceDrawableEnd();
++#endif
+ 
+     MTL::RenderPassDescriptor* current_render_pass = mFramebuffers[0].mRenderPassDescriptor;
+     ImGui_ImplMetal_NewFrame(current_render_pass);
+@@ -1944,6 +1962,15 @@
+ }
+ 
+ void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
++#ifdef __IOS__
++    // overlay 0041: `fbrd` (the flame effect's readback waits on the GPU)
++    struct PbSpkFbrd {
++        unsigned long long t0;
++        ~PbSpkFbrd() {
++            PBIos_SpkAdd(1, t0);
++        }
++    } pbSpkFbrd{ PBIos_SpkNow() };
++#endif
+     if (fb_id >= (int)mFramebuffers.size()) {
+         return;
+     }
+--- a/external/libultraship/src/fast/backends/gfx_sdl2.cpp
++++ b/external/libultraship/src/fast/backends/gfx_sdl2.cpp
+@@ -904,6 +904,13 @@
+     previous_time = t;
+ }
+ 
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0041, D40): the frame's CPU work ends here and LUS's
++// nanosleep pacer begins.
++extern "C" void PBIos_PaceSleepBegin(void);
++extern "C" void PBIos_PaceSleepEnd(void);
++#endif
++
+ void GfxWindowBackendSDL2::SwapBuffersBegin() {
+     bool nextVsyncEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_VSYNC_ENABLED, 1);
+ 
+@@ -913,7 +920,13 @@
+         SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
+     }
+ 
++#ifdef __IOS__
++    PBIos_PaceSleepBegin();
++#endif
+     SyncFramerateWithTime();
++#ifdef __IOS__
++    PBIos_PaceSleepEnd();
++#endif
+     SDL_GL_SwapWindow(mWnd);
+ }
+ 
+--- a/external/libultraship/src/ship/window/gui/Gui.cpp
++++ b/external/libultraship/src/ship/window/gui/Gui.cpp
+@@ -16,6 +16,21 @@
+ #include "ship/window/gui/Fonts.h"
+ #include "ship/window/gui/resource/GuiTextureFactory.h"
+ #include "ship/window/gui/resource/GuiTexture.h"
++
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0041, D40): spike probe seams; the probe lives in
++// src/port/ios/PBIosSpikeProbe.cpp. PBIos_SpkNow returns 0 while the probe is
++// off or off the main thread, and PBIos_SpkAdd ignores a 0 start.
++extern "C" unsigned long long PBIos_SpkNow(void);
++extern "C" void PBIos_SpkAdd(int cat, unsigned long long t0);
++#endif
++#ifdef __IOS__
++// The menu-phase split (Shipwright 0068): time since the previous mark goes to
++// the bucket; every GuiWindow is timed by name.
++extern "C" void PBIos_MenuMark(int bucket);
++extern "C" void PBIos_MenuWinBegin(void);
++extern "C" void PBIos_MenuWinEnd(const char* name);
++#endif
+ 
+ namespace Ship {
+ #define TOGGLE_BTN ImGuiKey_F1
+@@ -267,20 +282,38 @@
+             ->Dispatch("reset");
+     }
+ 
++#ifdef __IOS__
++    PBIos_MenuMark(3); // overlay 0041: dock (DrawMenu up to the menu bar)
++#endif
+     if (GetMenuBar()) {
+         GetMenuBar()->Update();
+         GetMenuBar()->Draw();
+     }
++#ifdef __IOS__
++    PBIos_MenuMark(4); // bar
++#endif
+ 
+     if (GetMenu()) {
+         GetMenu()->Update();
+         GetMenu()->Draw();
+     }
++#ifdef __IOS__
++    PBIos_MenuMark(5); // menu
++#endif
+ 
+     for (auto& windowIter : mGuiWindows) {
++#ifdef __IOS__
++        PBIos_MenuWinBegin();
++#endif
+         windowIter.second->Update();
+         windowIter.second->Draw();
++#ifdef __IOS__
++        PBIos_MenuWinEnd(windowIter.first.c_str());
++#endif
+     }
++#ifdef __IOS__
++    PBIos_MenuMark(6); // win (every GuiWindow, incl. the SDL pump one)
++#endif
+ 
+     ImGui::End();
+ }
+@@ -302,8 +335,17 @@
+ void Gui::StartFrame() {
+     HandleMouseCapture();
+     ImGuiBackendNewFrame();
++#ifdef __IOS__
++    PBIos_MenuMark(0); // overlay 0041: nf (backend NewFrame; the probe removes the drawable wait)
++#endif
+     ImGuiWMNewFrame();
++#ifdef __IOS__
++    PBIos_MenuMark(1); // wm (ImGui SDL2 NewFrame)
++#endif
+     ImGui::NewFrame();
++#ifdef __IOS__
++    PBIos_MenuMark(2); // ig (ImGui::NewFrame)
++#endif
+ }
+ 
+ void Gui::EndFrame() {
+@@ -324,7 +366,13 @@
+ 
+ void Gui::CheckSaveCvars() {
+     if (mNeedsConsoleVariableSave) {
++#ifdef __IOS__
++        const unsigned long long pbSpkT0 = PBIos_SpkNow(); // overlay 0041: `cvsave`
++#endif
+         Ship::Context::GetRawInstance()->GetConsoleVariables()->Save();
++#ifdef __IOS__
++        PBIos_SpkAdd(5, pbSpkT0);
++#endif
+         mNeedsConsoleVariableSave = false;
+     }
+ }
+--- a/external/libultraship/src/ship/controller/physicaldevice/SDLAddRemoveDeviceEventHandler.cpp
++++ b/external/libultraship/src/ship/controller/physicaldevice/SDLAddRemoveDeviceEventHandler.cpp
+@@ -5,6 +5,14 @@
+ #include "ship/window/Window.h"
+ #include "ship/window/gui/Gui.h"
+ 
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0041, D40): spike probe seams; the probe lives in
++// src/port/ios/PBIosSpikeProbe.cpp. PBIos_SpkNow returns 0 while the probe is
++// off or off the main thread, and PBIos_SpkAdd ignores a 0 start.
++extern "C" unsigned long long PBIos_SpkNow(void);
++extern "C" void PBIos_SpkAdd(int cat, unsigned long long t0);
++#endif
++
+ namespace Ship {
+ 
+ SDLAddRemoveDeviceEventHandler::~SDLAddRemoveDeviceEventHandler() {
+@@ -17,7 +25,15 @@
+ }
+ 
+ void SDLAddRemoveDeviceEventHandler::UpdateElement() {
++#ifdef __IOS__
++    // overlay 0041: `pump` - on iOS this runs the UIKit run loop (touches, the
++    // touch overlay's drawing, timers) inside the game frame, every frame.
++    const unsigned long long pbSpkT0 = PBIos_SpkNow();
++#endif
+     SDL_PumpEvents();
++#ifdef __IOS__
++    PBIos_SpkAdd(3, pbSpkT0);
++#endif
+     SDL_Event event;
+     bool changed = false;
+     while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_CONTROLLERDEVICEADDED, SDL_CONTROLLERDEVICEADDED) > 0) {
+--- a/external/libultraship/src/ship/resource/ResourceManager.cpp
++++ b/external/libultraship/src/ship/resource/ResourceManager.cpp
+@@ -9,6 +9,13 @@
+ #include "ship/utils/Utils.h"
+ #include "ship/config/ConsoleVariable.h"
+ #include "ship/Context.h"
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0041, D40): spike probe seams; the probe lives in
++// src/port/ios/PBIosSpikeProbe.cpp. PBIos_SpkNow returns 0 while the probe is
++// off or off the main thread, and PBIos_SpkAdd ignores a 0 start.
++extern "C" unsigned long long PBIos_SpkNow(void);
++extern "C" void PBIos_SpkAdd(int cat, unsigned long long t0);
++#endif
+ 
+ namespace Ship {
+ 
+@@ -251,6 +258,15 @@
+         return cached;
+     }
+ 
++#ifdef __IOS__
++    // overlay 0041: `res` - a cache miss the caller waits on (main thread only).
++    struct PbSpkRes {
++        unsigned long long t0;
++        ~PbSpkRes() {
++            PBIos_SpkAdd(0, t0);
++        }
++    } pbSpkRes{ PBIos_SpkNow() };
++#endif
+     const auto waitStart = std::chrono::steady_clock::now();
+     auto resource = LoadResourceAsync(identifier, loadExact, BS::pr::highest, initData).get();
+     mStatBlockingCalls.fetch_add(1, std::memory_order_relaxed);
+--- a/src/port/Game.cpp
++++ b/src/port/Game.cpp
+@@ -21,6 +21,14 @@
+ #include <SDL2/SDL_main.h>
+ #endif
+ 
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0041, D40): spike probe seams; the probe lives in
++// src/port/ios/PBIosSpikeProbe.cpp. PBIos_SpkNow returns 0 while the probe is
++// off or off the main thread, and PBIos_SpkAdd ignores a 0 start.
++extern "C" unsigned long long PBIos_SpkNow(void);
++extern "C" void PBIos_SpkAdd(int cat, unsigned long long t0);
++#endif
++
+ MtxF sInterpolationMatrixStack[0x1000];
+ MtxF* gInterpolationMatrix = &sInterpolationMatrixStack[0];
+ 
+@@ -165,7 +173,13 @@
+     while (wnd->IsRunning()) {
+         ThreadWatchdog_Beat(WATCHDOG_MAIN_LOOP);
+         GameEngine::Instance->StartFrame();
++#ifdef __IOS__
++        const unsigned long long pbSpkSi = PBIos_SpkNow(); // overlay 0041: `si`
++#endif
+         OS_SiService();
++#ifdef __IOS__
++        PBIos_SpkAdd(4, pbSpkSi);
++#endif
+         GameEngine::DrainRenderService();
+         if (!ServiceRcp()) {
+             if (ThreadWatchdog_IsStalled(WATCHDOG_GAME_TICK)) {
+@@ -173,7 +187,13 @@
+                 SDL_Delay(16);
+                 continue;
+             }
++#ifdef __IOS__
++            const unsigned long long pbSpkIdle = PBIos_SpkNow(); // overlay 0041: `idle`
++#endif
+             SDL_Delay(1);
++#ifdef __IOS__
++            PBIos_SpkAdd(6, pbSpkIdle);
++#endif
+         }
+ #ifdef __EMSCRIPTEN__
+         // A tab can close without warning, so sync periodically, not just on exit.

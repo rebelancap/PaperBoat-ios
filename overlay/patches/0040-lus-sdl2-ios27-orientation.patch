@@ -1,0 +1,278 @@
+Overlay patch 0040 - SDL2 on iOS 27: interface orientation from the window
+scene, not the status bar (port of Shipwright 0059 / Ghostship 0054).
+
+CLASS: (b) upstream bug fix worth sending (SDL's, carried through LUS).
+
+THE BUG. iOS 27 made -[UIApplication statusBarOrientation] a deprecated no-op
+for apps linked against the iOS 27 SDK (it reports Unknown). SDL 2.32.10's
+UIKit backend trusts it in four places (SDL_OnApplicationDidChangeStatusBar-
+Orientation, UIKit_IsDisplayLandscape, UIKit_ComputeViewFrame, the launch-image
+lookup), so an iOS-27-SDK build decides the landscape-only game is PORTRAIT:
+at launch (~1 s in, the first layout pass) and on every activation (Home-and-
+return, Notification/Control Center). The display modes swap to portrait and
+the engine renders a portrait 2D size into a landscape drawable. This is the
+"PB_SSAA in=1260x2736" portrait launch STATUS rounds 24-26 recorded as
+"recurring, unexplained" (3 of 5 cold launches) - ~/dev/the porting notes "Second
+iOS 27 SDK trap".
+
+THE FIX.
+1. Adds external/libultraship/cmake/dependencies/patches/sdl2-ios27-orientation.patch
+   (source of truth: overlay/files/sdl2-ios27-orientation.patch). It is
+   Shipwright's patch re-based onto PRISTINE SDL release-2.32.10 (Shipwright
+   and Ghostship carry a visionOS-compat SDL patch underneath; PaperBoat does
+   not, so two hunks in SDL_uikitvideo.{h,m} moved). Content is unchanged:
+   UIKit_GetWindowScene/UIKit_GetInterfaceOrientation read the window scene's
+   interfaceOrientation (Unknown or no scene -> landscape); every
+   statusBarOrientation read uses it; ComputeViewFrame returns the scene's
+   coordinate-space bounds unflipped when the window has a scene;
+   SetupWindowData no longer swaps w/h for a window with a scene; the view
+   controller re-syncs the display mode on every layout pass and at the end of
+   every size transition. Every hunk is iOS-only code.
+2. Hunks LUS cmake/dependencies/ios.cmake to apply it at configure time right
+   after SDL2's FetchContent_MakeAvailable, through LUS's own git-patch.cmake
+   (apply, or accept already-applied, else FATAL_ERROR).
+
+The shell's landscape self-heal (app/ios/PaperBoatIosShell.m, Shipwright
+a69a0f6 + fdac188) is the backstop that re-derives the view chain after an
+activation; this patch removes the cause.
+
+Generator input: the vendor tree with 0001..0039 applied and 0040 not applied
+(idempotent: an already-present ios.cmake hunk is reversed in memory first).
+
+--- /dev/null
++++ b/external/libultraship/cmake/dependencies/patches/sdl2-ios27-orientation.patch
+@@ -0,0 +1,208 @@
++diff --git a/src/video/uikit/SDL_uikitappdelegate.m b/src/video/uikit/SDL_uikitappdelegate.m
++index 31b114a9..44e4aa4a 100644
++--- a/src/video/uikit/SDL_uikitappdelegate.m
+++++ b/src/video/uikit/SDL_uikitappdelegate.m
++@@ -89,7 +89,7 @@ int SDL_UIKitRunApp(int argc, char *argv[], SDL_main_func mainFunction)
++ /* Load a launch image using the old UILaunchImageFile-era naming rules. */
++ static UIImage *SDL_LoadLaunchImageNamed(NSString *name, int screenh)
++ {
++-    UIInterfaceOrientation curorient = [UIApplication sharedApplication].statusBarOrientation;
+++    UIInterfaceOrientation curorient = UIKit_GetInterfaceOrientation(); /* SOH_IOS: was statusBarOrientation */
++     UIUserInterfaceIdiom idiom = [UIDevice currentDevice].userInterfaceIdiom;
++     UIImage *image = nil;
++ 
++@@ -219,7 +219,7 @@ - (instancetype)initWithNibName:(NSString *)nibNameOrNil bundle:(NSBundle *)nibB
++         int screenh = (int)([UIScreen mainScreen].bounds.size.height + 0.5);
++ 
++ #if !TARGET_OS_TV
++-        UIInterfaceOrientation curorient = [UIApplication sharedApplication].statusBarOrientation;
+++        UIInterfaceOrientation curorient = UIKit_GetInterfaceOrientation(); /* SOH_IOS: was statusBarOrientation */
++ 
++         /* We always want portrait-oriented size, to match UILaunchImageSize. */
++         if (screenw > screenh) {
++diff --git a/src/video/uikit/SDL_uikitmodes.m b/src/video/uikit/SDL_uikitmodes.m
++index 97c59c25..299c611b 100644
++--- a/src/video/uikit/SDL_uikitmodes.m
+++++ b/src/video/uikit/SDL_uikitmodes.m
++@@ -355,7 +355,7 @@ SDL_bool UIKit_IsDisplayLandscape(UIScreen *uiscreen)
++ {
++ #if !TARGET_OS_TV
++     if (uiscreen == [UIScreen mainScreen]) {
++-        return UIInterfaceOrientationIsLandscape([UIApplication sharedApplication].statusBarOrientation);
+++        return UIInterfaceOrientationIsLandscape(UIKit_GetInterfaceOrientation()); /* SOH_IOS: was statusBarOrientation */
++     } else
++ #endif /* !TARGET_OS_TV */
++     {
++@@ -525,7 +525,12 @@ void UIKit_QuitModes(_THIS)
++ #if !TARGET_OS_TV
++ void SDL_OnApplicationDidChangeStatusBarOrientation(void)
++ {
++-    BOOL isLandscape = UIInterfaceOrientationIsLandscape([UIApplication sharedApplication].statusBarOrientation);
+++    /* SOH_IOS (iOS 27): statusBarOrientation is a no-op there; see
+++     * UIKit_GetInterfaceOrientation. This is also called from the view
+++     * controller's layout/transition path, because the status-bar
+++     * notification that used to drive it is not a reliable trigger any more. */
+++    const UIInterfaceOrientation interfaceOrientation = UIKit_GetInterfaceOrientation();
+++    BOOL isLandscape = UIInterfaceOrientationIsLandscape(interfaceOrientation);
++     SDL_VideoDisplay *display = SDL_GetDisplay(0);
++ 
++     if (display) {
++@@ -550,7 +555,7 @@ void SDL_OnApplicationDidChangeStatusBarOrientation(void)
++             currentmode->h = height;
++         }
++ 
++-        switch ([UIApplication sharedApplication].statusBarOrientation) {
+++        switch (interfaceOrientation) {
++         case UIInterfaceOrientationPortrait:
++             orientation = SDL_ORIENTATION_PORTRAIT;
++             break;
++diff --git a/src/video/uikit/SDL_uikitvideo.h b/src/video/uikit/SDL_uikitvideo.h
++index 4d3b81a9..47ebaf37 100644
++--- a/src/video/uikit/SDL_uikitvideo.h
+++++ b/src/video/uikit/SDL_uikitvideo.h
++@@ -35,6 +35,13 @@
++ 
++ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen);
++ 
+++#if !TARGET_OS_TV && !TARGET_OS_VISION
+++/* SOH_IOS (iOS 27): the interface orientation, read from the window scene.
+++ * -[UIApplication statusBarOrientation] is a deprecated no-op on iOS 27. */
+++UIWindowScene *UIKit_GetWindowScene(void) API_AVAILABLE(ios(13.0));
+++UIInterfaceOrientation UIKit_GetInterfaceOrientation(void);
+++#endif
+++
++ #endif /* __OBJC__ */
++ 
++ void UIKit_SuspendScreenSaver(_THIS);
++diff --git a/src/video/uikit/SDL_uikitvideo.m b/src/video/uikit/SDL_uikitvideo.m
++index f7aa3fd1..44ecfc4c 100644
++--- a/src/video/uikit/SDL_uikitvideo.m
+++++ b/src/video/uikit/SDL_uikitvideo.m
++@@ -194,6 +194,42 @@ SDL_bool UIKit_IsSystemVersionAtLeast(double version)
++     return [[UIDevice currentDevice].systemVersion doubleValue] >= version;
++ }
++ 
+++#if !TARGET_OS_TV
+++/* SOH_IOS (iOS 27): -[UIApplication statusBarOrientation] "has been
+++ * deprecated and is a no-op on 27.0 and later" -- it stops reporting the
+++ * real orientation, and every SDL path that trusted it (the display-mode
+++ * swap, UIKit_IsDisplayLandscape, the view-frame flip below) swapped the
+++ * landscape game to portrait on each activation. The window scene's
+++ * interfaceOrientation is the replacement (iOS 13+; the floor is 15).
+++ * No scene yet, or Unknown: report landscape (this app is landscape-only). */
+++UIWindowScene *UIKit_GetWindowScene(void)
+++{
+++    UIWindowScene *best = nil;
+++    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+++        if (![scene isKindOfClass:[UIWindowScene class]]) {
+++            continue;
+++        }
+++        if (best == nil || scene.activationState == UISceneActivationStateForegroundActive) {
+++            best = (UIWindowScene *)scene;
+++        }
+++    }
+++    return best;
+++}
+++
+++UIInterfaceOrientation UIKit_GetInterfaceOrientation(void)
+++{
+++    UIInterfaceOrientation orient = UIInterfaceOrientationUnknown;
+++    UIWindowScene *scene = UIKit_GetWindowScene();
+++    if (scene != nil) {
+++        orient = scene.interfaceOrientation;
+++    }
+++    if (orient == UIInterfaceOrientationUnknown) {
+++        orient = UIInterfaceOrientationLandscapeRight;
+++    }
+++    return orient;
+++}
+++#endif /* !TARGET_OS_TV */
+++
++ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
++ {
++     SDL_WindowData *data = (__bridge SDL_WindowData *) window->driverdata;
++@@ -212,6 +248,17 @@ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
++     }
++ 
++ #if !TARGET_OS_TV
+++    /* SOH_IOS (iOS 27): with a window scene, the scene's coordinate space IS
+++     * the interface geometry (already oriented). Never flip it: a flip here
+++     * produced a view whose shape disagreed with its window (stretched
+++     * after activation; a zero-height view mid-rotation). */
+++    if (data != nil && data.uiwindow != nil && data.uiwindow.windowScene != nil) {
+++        CGRect sb = data.uiwindow.windowScene.coordinateSpace.bounds;
+++        if (sb.size.width > 0 && sb.size.height > 0) {
+++            return sb;
+++        }
+++    }
+++
++     /* iOS 10 seems to have a bug where, in certain conditions, putting the
++      * device to sleep with the a landscape-only app open, re-orienting the
++      * device to portrait, and turning it back on will result in the screen
++@@ -220,7 +267,7 @@ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
++      * https://bugzilla.libsdl.org/show_bug.cgi?id=3505
++      * https://bugzilla.libsdl.org/show_bug.cgi?id=3465
++      * https://forums.developer.apple.com/thread/65337 */
++-    orient = [UIApplication sharedApplication].statusBarOrientation;
+++    orient = UIKit_GetInterfaceOrientation(); /* SOH_IOS: was statusBarOrientation */
++     landscape = UIInterfaceOrientationIsLandscape(orient) ||
++                     !(UIKit_GetSupportedOrientations(window) & (UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown));
++     fullscreen = CGRectEqualToRect(screen.bounds, frame);
++diff --git a/src/video/uikit/SDL_uikitviewcontroller.m b/src/video/uikit/SDL_uikitviewcontroller.m
++index dee4b197..8ecb4170 100644
++--- a/src/video/uikit/SDL_uikitviewcontroller.m
+++++ b/src/video/uikit/SDL_uikitviewcontroller.m
++@@ -24,6 +24,7 @@
++ 
++ #include "SDL_video.h"
++ #include "SDL_hints.h"
+++#include "SDL_system.h" /* SOH_IOS: SDL_OnApplicationDidChangeStatusBarOrientation */
++ #include "../SDL_sysvideo.h"
++ #include "../../events/SDL_events_c.h"
++ 
++@@ -229,6 +230,14 @@ - (void)viewDidLayoutSubviews
++     int w = (int) size.width;
++     int h = (int) size.height;
++ 
+++#if !TARGET_OS_TV && !TARGET_OS_VISION
+++    /* SOH_IOS (iOS 27): keep the display mode in step with the scene before
+++     * the size goes out (UIApplicationDidChangeStatusBarOrientation-
+++     * Notification is not a dependable trigger once statusBarOrientation is
+++     * a no-op). Idempotent: it only swaps on a mismatch and the orientation
+++     * event is de-duplicated. */
+++    SDL_OnApplicationDidChangeStatusBarOrientation();
+++#endif
++     SDL_SendWindowEvent(window, SDL_WINDOWEVENT_RESIZED, w, h);
++ }
++ 
++@@ -383,6 +392,9 @@ - (void)viewWillTransitionToSize:(CGSize)size withTransitionCoordinator:(id<UIVi
++     [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext> context) {}
++                                  completion:^(id<UIViewControllerTransitionCoordinatorContext> context) {
++         self->rotatingOrientation = NO;
+++#if !TARGET_OS_TV && !TARGET_OS_VISION
+++        SDL_OnApplicationDidChangeStatusBarOrientation(); /* SOH_IOS (iOS 27) */
+++#endif
++     }];
++ }
++ 
++diff --git a/src/video/uikit/SDL_uikitwindow.m b/src/video/uikit/SDL_uikitwindow.m
++index 0e0ea057..75a8a9d7 100644
++--- a/src/video/uikit/SDL_uikitwindow.m
+++++ b/src/video/uikit/SDL_uikitwindow.m
++@@ -118,8 +118,14 @@ static int SetupWindowData(_THIS, SDL_Window *window, UIWindow *uiwindow, SDL_bo
++         BOOL supportsLandscape = (orients & UIInterfaceOrientationMaskLandscape) != 0;
++         BOOL supportsPortrait = (orients & (UIInterfaceOrientationMaskPortrait|UIInterfaceOrientationMaskPortraitUpsideDown)) != 0;
++ 
++-        /* Make sure the width/height are oriented correctly */
++-        if ((width > height && !supportsLandscape) || (height > width && !supportsPortrait)) {
+++        /* Make sure the width/height are oriented correctly.
+++         * SOH_IOS (iOS 27): not when the window has a scene -- the frame is
+++         * then the scene's real geometry, and swapping it made SDL's size
+++         * disagree with the view (a portrait-started scene, e.g. inside
+++         * LiveContainer, rotates to landscape moments later and the view
+++         * controller reports the true size as a RESIZED event). */
+++        if (uiwindow.windowScene == nil &&
+++            ((width > height && !supportsLandscape) || (height > width && !supportsPortrait))) {
++             int temp = width;
++             width = height;
++             height = temp;
+--- a/external/libultraship/cmake/dependencies/ios.cmake
++++ b/external/libultraship/cmake/dependencies/ios.cmake
+@@ -12,6 +12,23 @@
+     )
+     FetchContent_MakeAvailable(SDL2)
+ endif()
++# PAPERBOAT_IOS (overlay 0040): iOS 27 made statusBarOrientation a no-op; SDL's
++# UIKit backend reads the window scene's interfaceOrientation instead (Shipwright
++# 0059, re-based onto pristine release-2.32.10). git-patch.cmake without reset =
++# apply, or accept already-applied, else FATAL.
++if (NOT ${SDL2_FOUND})
++    if (NOT sdl2_SOURCE_DIR)
++        message(FATAL_ERROR "overlay 0040: sdl2_SOURCE_DIR unset; cannot apply sdl2-ios27-orientation.patch")
++    endif()
++    execute_process(
++        COMMAND ${CMAKE_COMMAND} -Dpatch_file=${CMAKE_CURRENT_SOURCE_DIR}/cmake/dependencies/patches/sdl2-ios27-orientation.patch -Dwith_reset=FALSE -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/dependencies/git-patch.cmake
++        WORKING_DIRECTORY ${sdl2_SOURCE_DIR}
++        RESULT_VARIABLE sdl2_ios27_patch_ret
++    )
++    if (NOT sdl2_ios27_patch_ret EQUAL 0)
++        message(FATAL_ERROR "overlay 0040: sdl2-ios27-orientation.patch failed to apply")
++    endif()
++endif()
+ 
+ #=================== nlohmann-json ===================
+ find_package(nlohmann_json QUIET)

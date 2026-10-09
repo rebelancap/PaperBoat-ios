@@ -70,6 +70,7 @@
 #include <string.h>
 #include <mach-o/dyld.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/ucontext.h>
 #include <time.h>
 #include <unistd.h>
@@ -125,6 +126,16 @@ static void PBIos_ConsumePendingIntent(void);
 // this file, installed from the two lifecycle points below.
 static void PBIos_InstallTouchOverlay(void);
 static NSString* PBIos_TouchProbe(NSArray<NSString*>* args);
+// iOS 27 / LiveContainer landscape + game-view self-heal (D37) — defined near
+// the bottom of this file, called from the scene delegate, the window graft
+// and the touch overlay's 0.25 s tick.
+static void PBIos_HealOrientation(const char* why);
+static void PBIos_OrientationTick(void);
+// Perf 2026-10-09 (D38) bridge instruments, defined beside the overlay globals.
+// MAIN THREAD ONLY.
+static NSString* PBIos_OverlayShot(NSString* name);
+static NSString* PBIos_StickSpinBegin(CGFloat cx, CGFloat cy, CGFloat r, double secs, double rps);
+static NSString* PBIos_TouchZ(int ms);
 
 // The scene we hand SDL's window to. Strong is wrong (UIKit owns the scene and
 // a stale one after a disconnect would be a dangling graft target); weak lets
@@ -243,6 +254,27 @@ static void PBIos_AdoptAllWindows(void) {
     // An App Intent run while the app is already alive drops its request in
     // UserDefaults and foregrounds us; this is where that arrives.
     PBIos_ConsumePendingIntent();
+    // iOS 27: every activation (Home-and-return, Notification/Control Center
+    // dismissed) could leave the game portrait/stretched - SDL read the no-op
+    // statusBarOrientation (fixed at the source by overlay 0040). Re-assert
+    // landscape and re-derive the game view's size here as the backstop.
+    PBIos_HealOrientation("sceneDidBecomeActive");
+}
+
+// Rotation / geometry change. Under LiveContainer the host's plist allows
+// portrait, so FrontBoard can hand this landscape-only app a portrait scene.
+// Both selectors: iOS 26 added the effective-geometry callback and deprecates
+// the coordinate-space one.
+- (void)windowScene:(UIWindowScene*)windowScene
+    didUpdateCoordinateSpace:(id<UICoordinateSpace>)previousCoordinateSpace
+        interfaceOrientation:(UIInterfaceOrientation)previousInterfaceOrientation
+             traitCollection:(UITraitCollection*)previousTraitCollection {
+    PBIos_HealOrientation("didUpdateCoordinateSpace");
+}
+
+- (void)windowScene:(UIWindowScene*)windowScene
+    didUpdateEffectiveGeometry:(UIWindowSceneGeometry*)previousEffectiveGeometry API_AVAILABLE(ios(26.0)) {
+    PBIos_HealOrientation("didUpdateEffectiveGeometry");
 }
 
 // The app is running: UIKit hands a tapped/`simctl openurl` link over here.
@@ -271,6 +303,7 @@ static void PBIos_AdoptAllWindows(void) {
 
 - (void)sceneWillEnterForeground:(UIScene*)scene {
     PBIos_SetBackgrounded(0);
+    PBIos_HealOrientation("sceneWillEnterForeground");
 }
 
 @end
@@ -333,6 +366,26 @@ int PBIos_IsBackgrounded(void) {
 // NSProcessInfo caches this; it is not an expensive call.
 int PBIos_ThermalState(void) {
     return (int)NSProcessInfo.processInfo.thermalState;
+}
+
+// Perf 2026-10-09 (overlay 0041's PB_PACE line, Shipwright D-084): power state
+// beside thermal, because Low Power Mode caps the panel at 60 Hz and charging
+// heats the phone before thermalState moves. Bits: 1 = Low Power Mode,
+// 2 = charging, 4 = full (plugged in), 8 = battery state unknown. Game (main)
+// thread.
+int PBIos_PowerState(void) {
+    int bits = NSProcessInfo.processInfo.isLowPowerModeEnabled ? 1 : 0;
+    UIDevice* dev = UIDevice.currentDevice;
+    if (!dev.batteryMonitoringEnabled) {
+        dev.batteryMonitoringEnabled = YES;
+    }
+    switch (dev.batteryState) {
+        case UIDeviceBatteryStateCharging: bits |= 2; break;
+        case UIDeviceBatteryStateFull: bits |= 4; break;
+        case UIDeviceBatteryStateUnknown: bits |= 8; break;
+        default: break;
+    }
+    return bits;
 }
 
 static void PBIos_SetBackgrounded(int backgrounded) {
@@ -655,32 +708,6 @@ static float PBIos_SsaaDeviceDefault(void) {
 // it is opened on, which is why D23 rejected seeding in the first place.
 float PBIos_SsaaDefaultValue(void) {
     return PBIos_SsaaDeviceDefault();
-}
-
-// The texture cache's byte budget, in MB, when the player has not set
-// `gSohIos.TexCacheBudgetMB` (overlay 0037 reads this through a C ABI). A
-// QUARTER of physical memory, capped at the SoH port's flat 1536 MB and floored
-// at 192 MB. Reasoning in D33: the cap is what the SoH port tuned on the same
-// class of phone, the fraction is what keeps a 4 GB device from handing a
-// texture cache more than the whole app is likely to be allowed, and the floor
-// keeps the cache larger than any single scene's working set. Logged once,
-// because a budget nobody can see is a budget nobody can explain.
-int PBIos_TexCacheBudgetDefaultMB(void) {
-    static int cached = 0;
-    if (cached > 0) {
-        return cached;
-    }
-    const unsigned long long physMb = (unsigned long long)(NSProcessInfo.processInfo.physicalMemory >> 20);
-    unsigned long long budget = physMb / 4;
-    if (budget > 1536) {
-        budget = 1536;
-    }
-    if (budget < 192) {
-        budget = 192;
-    }
-    cached = (int)budget;
-    NSLog(@"[PaperBoatIosShell] texture cache budget default %d MB (physical %llu MB)", cached, physMb);
-    return cached;
 }
 
 float PBIos_SsaaFactor(void) {
@@ -1146,6 +1173,48 @@ static NSString* PBIos_HandleConsoleLine(NSString* raw) {
         }
         return line ?: @"err main thread did not answer in 3s (game loop blocked?)";
     }
+    // Perf 2026-10-09 (D38) instruments, ported from Shipwright D-088:
+    //   overlayshot NAME            the touch overlay ALONE (its view
+    //                               hierarchy as displayed) -> Documents/NAME.png,
+    //                               transparent, for pixel diffs across builds
+    //   stickspin CX CY R SECS [RPS] a synthetic finger lands at (CX,CY) pt
+    //                               (spawning the floating stick there), circles
+    //                               at radius R, RPS turns/s (default 1; 0 = hold
+    //                               deflected right), moved at 120 Hz, lifts
+    //                               after SECS
+    //   tc z [MS]                   hold the touch Z chip for MS (default 200)
+    if ([cmd isEqualToString:@"overlayshot"] && tok.count >= 2) {
+        NSString* name = tok[1];
+        __block NSString* reply = nil;
+        dispatch_async(dispatch_get_main_queue(), ^{ reply = PBIos_OverlayShot(name); });
+        for (int i = 0; i < 300 && reply == nil; i++) {
+            usleep(10 * 1000);
+        }
+        return reply ?: @"err main thread did not answer in 3s";
+    }
+    if ([cmd isEqualToString:@"stickspin"] && tok.count >= 5) {
+        const CGFloat cx = tok[1].floatValue, cy = tok[2].floatValue, r = tok[3].floatValue;
+        const double secs = tok[4].doubleValue;
+        const double rps = tok.count >= 6 ? tok[5].doubleValue : 1.0;
+        __block NSString* reply = nil;
+        dispatch_async(dispatch_get_main_queue(), ^{ reply = PBIos_StickSpinBegin(cx, cy, r, secs, rps); });
+        for (int i = 0; i < 300 && reply == nil; i++) {
+            usleep(10 * 1000);
+        }
+        return reply ?: @"err main thread did not answer in 3s";
+    }
+    if ([cmd isEqualToString:@"tc"] && tok.count >= 2) {
+        if (![tok[1].lowercaseString isEqualToString:@"z"]) {
+            return @"err tc z [ms]";
+        }
+        const int ms = tok.count >= 3 ? tok[2].intValue : 200;
+        __block NSString* reply = nil;
+        dispatch_async(dispatch_get_main_queue(), ^{ reply = PBIos_TouchZ(ms); });
+        for (int i = 0; i < 300 && reply == nil; i++) {
+            usleep(10 * 1000);
+        }
+        return reply ?: @"err main thread did not answer in 3s";
+    }
     if ([cmd isEqualToString:@"bg"]) {
         return [NSString stringWithFormat:@"ok backgrounded=%d", PBIos_IsBackgrounded()];
     }
@@ -1231,7 +1300,7 @@ static NSString* PBIos_HandleConsoleLine(NSString* raw) {
     }
     if ([cmd isEqualToString:@"help"] && tok.count == 1) {
         return @"ok bridge commands: ping ver fps thermal safearea ssaa touch pad texcache bg flush crashlog "
-               @"crashtest help quit\n"
+               @"crashtest overlayshot stickspin tc help quit\n"
                @"     anything else is passed to libultraship's console (try: help lus, get <cvar>, set <cvar> <v>)";
     }
     if ([cmd isEqualToString:@"help"] && tok.count > 1) {
@@ -1716,6 +1785,47 @@ void PBIos_GetSafeAreaInsetsPoints(float* top, float* left, float* bottom, float
 // --- The overlay ------------------------------------------------------------
 
 @interface PBIosTouchOverlay : UIView
+// D38 (Shipwright D-088): drawing entry for the overlay's canvases (role 0:
+// everything except the stick and Z; role 1: the Z chip only, in its own
+// small view).
+- (void)pbDrawCanvasRole:(int)role inView:(UIView*)view;
+// Bridge `stickspin` (D38): drive the floating stick through the same code
+// the real touch handlers use, with a synthetic finger.
+- (BOOL)pbSynthStickBegan:(CGPoint)p;
+- (void)pbSynthStickMoved:(CGPoint)p;
+- (void)pbSynthStickEnded;
+@end
+
+// D38 (perf 2026-10-09, Shipwright D-088): the overlay no longer draws itself.
+// LUS pumps SDL events (= the UIKit run loop) INSIDE the game frame, so every
+// full-screen Core Graphics repaint of this overlay was game-thread time. Its
+// content is split so the frequent changes stop repainting a screen-sized
+// bitmap:
+//   _stickView  the floating stick's ring + knob as two CAShapeLayers, moved by
+//               `position` (no redraw at all while the finger moves)
+//   _canvas     full-size, everything else (chips, customizer) - redrawn only
+//               on layout / visibility / mode / customizer changes
+//   _zCanvas    just the Z chip, so its pressed tint repaints a ~80 pt view
+// All three are non-interactive subviews; touches still hit the overlay.
+@interface PBIosOverlayCanvas : UIView
+@property(nonatomic, weak) PBIosTouchOverlay* owner;
+@property(nonatomic) int role;
+@end
+
+@implementation PBIosOverlayCanvas
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = UIColor.clearColor;
+        self.opaque = NO;
+        self.contentMode = UIViewContentModeRedraw;
+        self.userInteractionEnabled = NO;
+    }
+    return self;
+}
+- (void)drawRect:(CGRect)rect {
+    [self.owner pbDrawCanvasRole:self.role inView:self];
+}
 @end
 
 // __unsafe_unretained, not __strong: this is a stack scratch array filled and
@@ -1793,6 +1903,13 @@ static BOOL PBIos_PhysicalControllerPresent(void) {
     NSString* _editSelected;
     BOOL _editTriggerArmed;
     BOOL _loggedFrame;
+    // D38: layered drawing (see PBIosOverlayCanvas).
+    UIView* _stickView;
+    CAShapeLayer* _ringLayer;
+    CAShapeLayer* _knobLayer;
+    CGFloat _ringLayerR, _knobLayerR;
+    PBIosOverlayCanvas* _canvas;
+    PBIosOverlayCanvas* _zCanvas;
 }
 
 // Rotation / scene resize arrives here first, and this is where the cached
@@ -1802,6 +1919,82 @@ static BOOL PBIos_PhysicalControllerPresent(void) {
 - (void)layoutSubviews {
     [super layoutSubviews];
     PBIos_MarkSafeAreaDirty();
+    [self pbLayoutZCanvas]; // D38
+    [self syncStickLayers];
+}
+
+// D38: every repaint request reaches the canvases (the old full-view redraw),
+// and the stick layers follow the same state. Nothing else.
+- (void)setNeedsDisplay {
+    [_canvas setNeedsDisplay];
+    [self pbLayoutZCanvas];
+    [_zCanvas setNeedsDisplay];
+    [self syncStickLayers];
+}
+
+// The Z canvas covers the Z chip (+ stroke/AA margin) at an integral point
+// origin, so its pixels land exactly where the full canvas put them.
+- (void)pbLayoutZCanvas {
+    if (_zCanvas == nil) {
+        return;
+    }
+    CGRect f = CGRectZero;
+    PBButton btns[PB_MAX_BUTTONS];
+    int n = 0;
+    [self buttonRects:btns count:&n];
+    for (int i = 0; i < n; i++) {
+        if ([btns[i].label isEqualToString:@"Z"]) {
+            const CGFloat r = btns[i].radius + 4;
+            f = CGRectIntegral(CGRectMake(btns[i].center.x - r, btns[i].center.y - r, r * 2, r * 2));
+            break;
+        }
+    }
+    if (!CGRectEqualToRect(f, _zCanvas.frame)) {
+        _zCanvas.frame = f;
+        [_zCanvas setNeedsDisplay];
+    }
+}
+
+// Floating stick: position-only updates, no implicit animation, no redraw.
+// Visible exactly when the old drawRect drew it.
+- (void)syncStickLayers {
+    if (_ringLayer == nil) {
+        return;
+    }
+    const BOOL show = _stickActive && !_editMode && !_layerOff && !_popupOpen && !_menuOpen && !_controllerMode &&
+                      ![self pbLegacyDraw];
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    _ringLayer.hidden = !show;
+    _knobLayer.hidden = !show;
+    if (show) {
+        const CGFloat scale = self.traitCollection.displayScale > 0 ? self.traitCollection.displayScale : 3.0;
+        if (_ringLayer.contentsScale != scale) {
+            _ringLayer.contentsScale = scale;
+            _knobLayer.contentsScale = scale;
+        }
+        const CGFloat ringR = (_stickBaseR + 8) * _layoutScale;
+        if (ringR != _ringLayerR) {
+            _ringLayerR = ringR;
+            const CGRect b = CGRectMake(0, 0, ringR * 2, ringR * 2);
+            _ringLayer.bounds = b;
+            CGPathRef path = CGPathCreateWithEllipseInRect(b, NULL);
+            _ringLayer.path = path;
+            CGPathRelease(path);
+        }
+        const CGFloat knobR = _stickKnobR * _layoutScale;
+        if (knobR != _knobLayerR) {
+            _knobLayerR = knobR;
+            const CGRect b = CGRectMake(0, 0, knobR * 2, knobR * 2);
+            _knobLayer.bounds = b;
+            CGPathRef path = CGPathCreateWithEllipseInRect(b, NULL);
+            _knobLayer.path = path;
+            CGPathRelease(path);
+        }
+        _ringLayer.position = _stickBase;
+        _knobLayer.position = _stickKnob;
+    }
+    [CATransaction commit];
 }
 
 // The rectangle the pad is laid out in: this view's FULL bounds.
@@ -1880,6 +2073,33 @@ static BOOL PBIos_PhysicalControllerPresent(void) {
         _layoutHidden = [NSMutableSet set];
         _layoutScale = 1.0;
         _stickHome = CGPointZero;
+        // D38: stick layers below the chip canvas (the chips drew over the
+        // stick in the old single drawRect), Z canvas on top.
+        _stickView = [[UIView alloc] initWithFrame:self.bounds];
+        _stickView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _stickView.userInteractionEnabled = NO;
+        _stickView.backgroundColor = UIColor.clearColor;
+        _ringLayer = [CAShapeLayer layer];
+        _ringLayer.fillColor = nil;
+        _ringLayer.strokeColor = [UIColor colorWithWhite:1 alpha:0.35].CGColor;
+        _ringLayer.lineWidth = 4;
+        _ringLayer.hidden = YES;
+        _knobLayer = [CAShapeLayer layer];
+        _knobLayer.fillColor = [UIColor colorWithWhite:1 alpha:0.28].CGColor;
+        _knobLayer.strokeColor = nil;
+        _knobLayer.hidden = YES;
+        [_stickView.layer addSublayer:_ringLayer];
+        [_stickView.layer addSublayer:_knobLayer];
+        [self addSubview:_stickView];
+        _canvas = [[PBIosOverlayCanvas alloc] initWithFrame:self.bounds];
+        _canvas.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        _canvas.owner = self;
+        _canvas.role = 0;
+        [self addSubview:_canvas];
+        _zCanvas = [[PBIosOverlayCanvas alloc] initWithFrame:CGRectZero];
+        _zCanvas.owner = self;
+        _zCanvas.role = 1;
+        [self addSubview:_zCanvas];
         [self loadLayoutFromCVars];
         // EditLayout is a transient trigger, not a setting: a stale persisted 1
         // (a config flush mid-edit) must never relaunch straight into the
@@ -2015,6 +2235,8 @@ static BOOL PBIos_PhysicalControllerPresent(void) {
     }
     const CGFloat opacity = (CGFloat)PBIos_CVarGetFloat("gSohIos.TouchOpacity", 0.8f);
     self.alpha = _editMode ? 1.0 : MAX(0.25, MIN(1.0, opacity));
+    // iOS 27 / LiveContainer landscape + game-view self-heal (D37).
+    PBIos_OrientationTick();
 }
 
 - (void)releaseAllControls {
@@ -2031,6 +2253,7 @@ static BOOL PBIos_PhysicalControllerPresent(void) {
     _stickActive = NO;
     _stickTouch = nil;
     _zHeld = NO;
+    [self syncStickLayers]; // D38
     PBIos_PadReleaseAll();
 }
 
@@ -2066,7 +2289,8 @@ static BOOL PBIos_PhysicalControllerPresent(void) {
             _zHeld = NO;
             PBIos_PadPress(PB_BTN_Z, NO);
         }
-        [self setNeedsDisplay];
+        [_zCanvas setNeedsDisplay]; // D38: only the Z chip repaints
+        [self pbTestFullRepaint];
         return;
     }
     PBButton btns[PB_MAX_BUTTONS];
@@ -2639,8 +2863,51 @@ static NSArray<NSString*>* PBIos_LayoutKeys(void) {
     [glyph drawAtPoint:CGPointMake(c.x - sz.width / 2, c.y - sz.height / 2) withAttributes:attrs];
 }
 
-- (void)drawRect:(CGRect)rect {
+// One gameplay-mode chip, exactly as the single drawRect drew it.
+- (void)pbDrawButton:(PBButton)bt ctx:(CGContextRef)ctx {
+    const BOOL isZ = [bt.label isEqualToString:@"Z"];
+    if (isZ && _zHeld) {
+        [[UIColor colorWithRed:0.25 green:0.45 blue:0.8 alpha:0.7] setFill];
+        [[UIColor colorWithWhite:1 alpha:0.7] setStroke];
+    } else {
+        [bt.color setFill];
+        [[UIColor colorWithWhite:1 alpha:0.5] setStroke];
+    }
+    const CGRect r = CGRectMake(bt.center.x - bt.radius, bt.center.y - bt.radius, bt.radius * 2, bt.radius * 2);
+    CGContextSetLineWidth(ctx, 3);
+    CGContextFillEllipseInRect(ctx, r);
+    CGContextStrokeEllipseInRect(ctx, r);
+    // Labels only where the glyph is not obvious: L/R/Z/≡, as on every
+    // sibling.
+    const BOOL labeled = isZ || [bt.label isEqualToString:@"L"] || [bt.label isEqualToString:@"R"] ||
+                         [bt.label isEqualToString:@"≡"];
+    if (labeled) {
+        [self drawGlyph:bt.label at:bt.center size:(bt.radius < 26 ? 16 : 20) alpha:0.95];
+    }
+}
+
+- (void)pbDrawCanvasRole:(int)role inView:(UIView*)view {
     CGContextRef ctx = UIGraphicsGetCurrentContext();
+
+    if (role == 1) {
+        // The Z chip alone, in overlay coordinates (the canvas sits at an
+        // integral origin). Only in plain gameplay mode; every other mode is
+        // drawn whole by role 0.
+        if (_editMode || _layerOff || _popupOpen || _menuOpen || _controllerMode || [self isButtonHidden:@"Z"] ||
+            [self pbLegacyDraw]) {
+            return;
+        }
+        CGContextTranslateCTM(ctx, -view.frame.origin.x, -view.frame.origin.y);
+        PBButton zb[PB_MAX_BUTTONS];
+        int zn = 0;
+        [self buttonRects:zb count:&zn];
+        for (int i = 0; i < zn; i++) {
+            if ([zb[i].label isEqualToString:@"Z"]) {
+                [self pbDrawButton:zb[i] ctx:ctx];
+            }
+        }
+        return;
+    }
 
     // The spec rule 6: UIKit placements need the view logging its own frame,
     // once per layout, because engine screenshots cannot see UIKit.
@@ -2757,8 +3024,10 @@ static NSArray<NSString*>* PBIos_LayoutKeys(void) {
         return;
     }
 
-    // Floating left stick: drawn only while a finger holds it.
-    if (_stickActive) {
+    // Floating left stick: _stickView's layers (syncStickLayers), not here -
+    // except under the legacy-draw test instrument, which is the old code.
+    const BOOL legacy = [self pbLegacyDraw];
+    if (legacy && _stickActive) {
         CGContextSetLineWidth(ctx, 4);
         [[UIColor colorWithWhite:1 alpha:0.35] setStroke];
         const CGFloat ringR = (_stickBaseR + 8) * _layoutScale;
@@ -2770,33 +3039,20 @@ static NSArray<NSString*>* PBIos_LayoutKeys(void) {
                                    CGRectMake(_stickKnob.x - knobR, _stickKnob.y - knobR, knobR * 2, knobR * 2));
     }
 
+    // Chips. Z is drawn by its own canvas (role 1) so a press repaints only
+    // that.
     PBButton btns[PB_MAX_BUTTONS];
     int n = 0;
     [self buttonRects:btns count:&n];
     for (int i = 0; i < n; i++) {
         const PBButton bt = btns[i];
-        const BOOL isZ = [bt.label isEqualToString:@"Z"];
+        if ([bt.label isEqualToString:@"Z"] && !legacy) {
+            continue; // role 1
+        }
         if ([self isButtonHidden:bt.label]) {
             continue;
         }
-        if (isZ && _zHeld) {
-            [[UIColor colorWithRed:0.25 green:0.45 blue:0.8 alpha:0.7] setFill];
-            [[UIColor colorWithWhite:1 alpha:0.7] setStroke];
-        } else {
-            [bt.color setFill];
-            [[UIColor colorWithWhite:1 alpha:0.5] setStroke];
-        }
-        const CGRect r = CGRectMake(bt.center.x - bt.radius, bt.center.y - bt.radius, bt.radius * 2, bt.radius * 2);
-        CGContextSetLineWidth(ctx, 3);
-        CGContextFillEllipseInRect(ctx, r);
-        CGContextStrokeEllipseInRect(ctx, r);
-        // Labels only where the glyph is not obvious: L/R/Z/≡, as on every
-        // sibling.
-        const BOOL labeled = isZ || [bt.label isEqualToString:@"L"] || [bt.label isEqualToString:@"R"] ||
-                             [bt.label isEqualToString:@"≡"];
-        if (labeled) {
-            [self drawGlyph:bt.label at:bt.center size:(bt.radius < 26 ? 16 : 20) alpha:0.95];
-        }
+        [self pbDrawButton:bt ctx:ctx];
     }
 }
 
@@ -2859,12 +3115,8 @@ static NSArray<NSString*>* PBIos_LayoutKeys(void) {
             [self applyButton:btns[idx].label down:YES];
         } else if (!_stickActive && [self pointInStickRegion:p]) {
             [self hapticTap];
-            _stickActive = YES;
+            [self pbStickBeganAt:p];
             _stickTouch = t;
-            _stickBase = [self clampStickBase:p];
-            _stickKnob = _stickBase;
-            [self updateStickAxesFromKnob];
-            [self setNeedsDisplay];
         }
     }
 }
@@ -2912,20 +3164,84 @@ static NSArray<NSString*>* PBIos_LayoutKeys(void) {
         if (t != _stickTouch) {
             continue;
         }
-        const CGPoint p = [t locationInView:self];
-        CGFloat dx = p.x - _stickBase.x, dy = p.y - _stickBase.y;
-        const CGFloat d = hypot(dx, dy);
-        if (d > _stickBaseR) {
-            dx = dx / d * _stickBaseR;
-            dy = dy / d * _stickBaseR;
-        }
-        const CGPoint knob = CGPointMake(_stickBase.x + dx, _stickBase.y + dy);
-        if (hypot(knob.x - _stickKnob.x, knob.y - _stickKnob.y) < 1.0) {
-            continue; // sub-point jitter
-        }
-        _stickKnob = knob;
-        [self updateStickAxesFromKnob];
-        [self setNeedsDisplay];
+        [self pbStickMovedTo:[t locationInView:self]];
+    }
+}
+
+// The stick's three phases, shared by the real touch handlers and the bridge's
+// synthetic finger (`stickspin`, D38).
+- (void)pbStickBeganAt:(CGPoint)p {
+    _stickActive = YES;
+    _stickBase = [self clampStickBase:p];
+    _stickKnob = _stickBase;
+    [self updateStickAxesFromKnob];
+    [self syncStickLayers]; // D38: no full repaint
+    [self pbTestFullRepaint]; // test instruments only (legacy draws the stick on the canvas)
+}
+
+- (void)pbStickMovedTo:(CGPoint)p {
+    CGFloat dx = p.x - _stickBase.x, dy = p.y - _stickBase.y;
+    const CGFloat d = hypot(dx, dy);
+    if (d > _stickBaseR) {
+        dx = dx / d * _stickBaseR;
+        dy = dy / d * _stickBaseR;
+    }
+    const CGPoint knob = CGPointMake(_stickBase.x + dx, _stickBase.y + dy);
+    if (hypot(knob.x - _stickKnob.x, knob.y - _stickKnob.y) < 1.0) {
+        return; // sub-point jitter
+    }
+    _stickKnob = knob;
+    [self updateStickAxesFromKnob];
+    [self syncStickLayers]; // D38: move the knob layer; no repaint
+    [self pbTestFullRepaint];
+}
+
+// Test instrument for the D38 A/B (not in any menu): gSohIos.OverlayFullRepaint=1
+// repaints the full-screen canvas on every stick move / Z press, i.e. the cost
+// the pre-D38 single drawRect paid, so before/after is one build and one CVar.
+- (void)pbTestFullRepaint {
+    if (PBIos_CVarGetInt("gSohIos.OverlayFullRepaint", 0) != 0 || [self pbLegacyDraw]) {
+        [_canvas setNeedsDisplay];
+    }
+}
+
+// Test instrument for the D38 fidelity diff (not in any menu):
+// gSohIos.OverlayLegacyDraw=1 draws the stick and Z on the full-screen canvas
+// with the pre-D38 Core Graphics code (and repaints it per move, as before), so
+// `overlayshot` can diff old vs new drawing in one build.
+- (BOOL)pbLegacyDraw {
+    return PBIos_CVarGetInt("gSohIos.OverlayLegacyDraw", 0) != 0;
+}
+
+- (void)pbStickEnded {
+    _stickActive = NO;
+    _stickTouch = nil;
+    _stickKnob = _stickBase;
+    atomic_store(&gPBPadStickX, 0);
+    atomic_store(&gPBPadStickY, 0);
+    [self syncStickLayers]; // D38
+    [self pbTestFullRepaint]; // test instruments only (legacy draws the stick on the canvas)
+}
+
+- (BOOL)pbSynthStickBegan:(CGPoint)p {
+    if (_editMode || _layerOff || _popupOpen || _menuOpen || _controllerMode || _stickActive ||
+        ![self pointInStickRegion:p]) {
+        return NO;
+    }
+    [self pbStickBeganAt:p];
+    _stickTouch = nil; // no UITouch owns it; only pbSynthStickEnded ends it
+    return YES;
+}
+
+- (void)pbSynthStickMoved:(CGPoint)p {
+    if (_stickActive && _stickTouch == nil) {
+        [self pbStickMovedTo:p];
+    }
+}
+
+- (void)pbSynthStickEnded {
+    if (_stickActive && _stickTouch == nil) {
+        [self pbStickEnded];
     }
 }
 
@@ -2948,12 +3264,7 @@ static NSArray<NSString*>* PBIos_LayoutKeys(void) {
             }
         }
         if (t == _stickTouch) {
-            _stickActive = NO;
-            _stickTouch = nil;
-            _stickKnob = _stickBase;
-            atomic_store(&gPBPadStickX, 0);
-            atomic_store(&gPBPadStickY, 0);
-            [self setNeedsDisplay];
+            [self pbStickEnded];
         }
     }
 }
@@ -2967,6 +3278,133 @@ static NSArray<NSString*>* PBIos_LayoutKeys(void) {
 }
 
 @end
+
+// --- ROM import: the system document picker (overlay 0042, D42) -------------
+//
+// Upstream's iOS branch of GameExtractor::SelectGameFromUI has no picker: it
+// loads Documents/baserom.us.z64 or fails, and the engine then shows the same
+// "Generate one now?" prompt again with no explanation. A user who has not
+// copied the ROM into the app's Files folder under exactly that name (or as a
+// .z64 at the root) taps Yes forever. Overlay 0042 sends that branch here
+// instead: a UIDocumentPickerViewController in import mode, presented from
+// the topmost view controller of SDL's (scene-adopted, landscape) window.
+//
+// THREADING. Called on the main thread from RunExtract's ImGui loop; that loop
+// keeps pumping the run loop (SDL_PumpEvents), so UIKit presents and drives the
+// picker while the engine keeps drawing behind it. The callback runs on the
+// main thread exactly once (picked path, or NULL on cancel / no presenter).
+//
+// Import mode (deprecated name, still the documented behaviour) hands back a
+// private copy in tmp/<bundle>-Inbox; the extractor reads it whole into memory
+// immediately, so nothing has to outlive the callback. Using the
+// UTType-based initializer would put UniformTypeIdentifiers on the link line
+// for no behavioural gain.
+typedef void (*PBIosRomPickedFn)(const char* path, void* user);
+
+@interface PBIosRomPickerDelegate : NSObject <UIDocumentPickerDelegate>
+@property(nonatomic, assign) PBIosRomPickedFn done;
+@property(nonatomic, assign) void* user;
+@end
+
+static PBIosRomPickerDelegate* gPBRomPicker = nil; // UIKit holds delegates weakly
+
+@implementation PBIosRomPickerDelegate
+
+- (void)finishWithPath:(NSString*)path {
+    PBIosRomPickerDelegate* keep = self; // survive clearing the global below
+    PBIosRomPickedFn fn = keep.done;
+    void* user = keep.user;
+    keep.done = NULL;
+    if (gPBRomPicker == keep) {
+        gPBRomPicker = nil;
+    }
+    if (fn != NULL) {
+        fn(path != nil ? path.fileSystemRepresentation : NULL, user);
+    }
+}
+
+- (void)documentPicker:(UIDocumentPickerViewController*)controller didPickDocumentsAtURLs:(NSArray<NSURL*>*)urls {
+    NSURL* url = urls.firstObject;
+    if (url == nil) {
+        [self finishWithPath:nil];
+        return;
+    }
+    const BOOL scoped = [url startAccessingSecurityScopedResource];
+    NSString* path = url.path;
+    // The predecessor saw user-imported files arrive root-owned 0700 once: make
+    // the copy readable by us and say what arrived.
+    chmod(path.fileSystemRepresentation, 0644);
+    NSDictionary* attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+    NSLog(@"[PaperBoatIosShell] ROM picked: %@ (%llu bytes, readable %d)", path,
+          (unsigned long long)[attrs fileSize], (int)[NSFileManager.defaultManager isReadableFileAtPath:path]);
+    [self finishWithPath:path];
+    if (scoped) {
+        [url stopAccessingSecurityScopedResource];
+    }
+}
+
+- (void)documentPickerWasCancelled:(UIDocumentPickerViewController*)controller {
+    NSLog(@"[PaperBoatIosShell] ROM picker cancelled");
+    [self finishWithPath:nil];
+}
+
+@end
+
+static UIViewController* PBIos_TopPresenter(void) {
+    UIWindowScene* scene = PBIos_ActiveWindowScene();
+    UIViewController* top = nil;
+    for (UIWindow* w in scene.windows) {
+        if (w == gPBSafeProbe || w.rootViewController == nil || w.hidden) {
+            continue;
+        }
+        if (top == nil || w.isKeyWindow) {
+            top = w.rootViewController;
+        }
+    }
+    while (top.presentedViewController != nil && !top.presentedViewController.isBeingDismissed) {
+        top = top.presentedViewController;
+    }
+    return top;
+}
+
+void PBIos_PickRomFile(PBIosRomPickedFn done, void* user) {
+    if (gPBRomPicker != nil) {
+        NSLog(@"[PaperBoatIosShell] ROM picker already open; ignoring a second request");
+        if (done != NULL) {
+            done(NULL, user);
+        }
+        return;
+    }
+    UIViewController* presenter = PBIos_TopPresenter();
+    if (presenter == nil) {
+        NSLog(@"[PaperBoatIosShell] WARNING: no view controller to present the ROM picker from");
+        if (done != NULL) {
+            done(NULL, user);
+        }
+        return;
+    }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    UIDocumentPickerViewController* picker =
+        [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[ @"public.data" ]
+                                                               inMode:UIDocumentPickerModeImport];
+#pragma clang diagnostic pop
+    gPBRomPicker = [PBIosRomPickerDelegate new];
+    gPBRomPicker.done = done;
+    gPBRomPicker.user = user;
+    picker.delegate = gPBRomPicker;
+    picker.allowsMultipleSelection = NO;
+    picker.modalPresentationStyle = UIModalPresentationFullScreen;
+    // The spec rule 6: the presenter logs its own frame (engine screenshots
+    // cannot see UIKit).
+    NSLog(@"[PaperBoatIosShell] presenting ROM picker from %@ (view frame %.0fx%.0f, scene orientation %ld)",
+          NSStringFromClass(presenter.class), presenter.view.frame.size.width, presenter.view.frame.size.height,
+          (long)presenter.view.window.windowScene.interfaceOrientation);
+    [presenter presentViewController:picker animated:YES completion:^{
+        NSLog(@"[PaperBoatIosShell] ROM picker on screen: frame %.0fx%.0f",
+              picker.view.frame.size.width, picker.view.frame.size.height);
+    }];
+}
 
 // --- Installation -----------------------------------------------------------
 //
@@ -3045,6 +3483,303 @@ static NSString* PBIos_TouchProbe(NSArray<NSString*>* args) {
     return [gPBTouchOverlay layoutProbe:args];
 }
 
+// Bridge `overlayshot` (D38). MAIN THREAD ONLY.
+static NSString* PBIos_OverlayShot(NSString* name) {
+    UIView* o = gPBTouchOverlay;
+    if (o == nil || o.bounds.size.width < 1) {
+        return @"err touch overlay not installed yet";
+    }
+    [o setNeedsDisplay]; // a test-instrument CVar may have changed since the last repaint
+    UIGraphicsImageRendererFormat* fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.opaque = NO;
+    UIGraphicsImageRenderer* r = [[UIGraphicsImageRenderer alloc] initWithSize:o.bounds.size format:fmt];
+    NSData* png = [r PNGDataWithActions:^(UIGraphicsImageRendererContext* c) {
+        [o drawViewHierarchyInRect:o.bounds afterScreenUpdates:YES];
+    }];
+    NSString* docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString* path = [docs stringByAppendingPathComponent:[name stringByAppendingString:@".png"]];
+    return [png writeToFile:path atomically:YES]
+               ? [NSString stringWithFormat:@"ok %@ %.0fx%.0f@%.0f", path, o.bounds.size.width, o.bounds.size.height,
+                                            fmt.scale]
+               : @"err write";
+}
+
+// Bridge `stickspin` (D38). MAIN THREAD ONLY. The finger is moved by a 120 Hz
+// main-queue timer, i.e. it is delivered by the same run-loop pump that
+// delivers real touches inside the game frame - which is the cost being
+// measured.
+static NSString* PBIos_StickSpinBegin(CGFloat cx, CGFloat cy, CGFloat r, double secs, double rps) {
+    if (gPBTouchOverlay == nil) {
+        return @"err touch overlay not installed yet";
+    }
+    if (![gPBTouchOverlay pbSynthStickBegan:CGPointMake(cx, cy)]) {
+        return @"err stick did not spawn there (outside the halo, a mode is up, or a stick is active)";
+    }
+    const CFTimeInterval t0 = CACurrentMediaTime();
+    __block dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    dispatch_source_t spin = timer;
+    dispatch_source_set_timer(spin, DISPATCH_TIME_NOW, NSEC_PER_SEC / 120, NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(spin, ^{
+        const double el = CACurrentMediaTime() - t0;
+        if (el >= secs || gPBTouchOverlay == nil) {
+            [gPBTouchOverlay pbSynthStickEnded];
+            dispatch_source_cancel(timer);
+            timer = nil; // breaks the block <-> source retain cycle
+            return;
+        }
+        const double a = 2.0 * M_PI * rps * el;
+        [gPBTouchOverlay pbSynthStickMoved:CGPointMake(cx + r * cos(a), cy + r * sin(a))];
+    });
+    dispatch_resume(spin);
+    return [NSString stringWithFormat:@"ok stickspin at %.0f,%.0f r=%.0f for %.1fs at %.2f rps", cx, cy, r, secs, rps];
+}
+
+// Bridge `tc z` (D38). MAIN THREAD ONLY.
+static NSString* PBIos_TouchZ(int ms) {
+    if (gPBTouchOverlay == nil) {
+        return @"err touch overlay not installed yet";
+    }
+    [gPBTouchOverlay applyButton:@"Z" down:YES];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)MAX(ms, 1) * NSEC_PER_MSEC), dispatch_get_main_queue(),
+                   ^{ [gPBTouchOverlay applyButton:@"Z" down:NO]; });
+    return [NSString stringWithFormat:@"ok Z held %d ms", ms];
+}
+
+// ---------------------------------------------------------------------------
+// iOS 27 / LiveContainer: landscape and game-view size are SELF-HEALING
+// (Shipwright a69a0f6 + fdac188, D-077; here D37).
+// ---------------------------------------------------------------------------
+// Two failure families, both new with the iOS 27 SDK build:
+//  1. statusBarOrientation became a no-op and SDL flipped its display mode to
+//     portrait at launch and on each activation (fixed at the source by
+//     overlay 0040; this is the backstop that re-derives the view chain after
+//     every activation).
+//  2. Inside LiveContainer the scene is negotiated with LiveContainer's own
+//     Info.plist (portrait allowed), so the scene can connect or rotate
+//     portrait, and a landscape request lands a moment later, mid-layout.
+// Rule: portrait bounds are never final. While the scene is portrait-shaped,
+// re-assert landscape (bounded: every 0.5 s for 3 s, polled at 100 ms), and
+// after every geometry change glue window -> scene and force SDL's view chain
+// to match, so the metal view re-derives drawableSize and SDL's view
+// controller reports RESIZED. If the system refuses landscape for good, the
+// game still renders unstretched into whatever the scene really is.
+static UIWindow* PBIos_GameWindowWithMetal(UIView** outMv) {
+    UIWindowScene* scene = PBIos_ActiveWindowScene();
+    for (UIWindow* w in scene.windows) {
+        if (w == gPBSafeProbe) {
+            continue;
+        }
+        CAMetalLayer* layer = PBIos_FindMetalLayer(w);
+        if (layer != nil && layer.delegate != nil && [(id)layer.delegate isKindOfClass:UIView.class]) {
+            if (outMv != NULL) {
+                *outMv = (UIView*)layer.delegate;
+            }
+            return w;
+        }
+    }
+    return nil;
+}
+
+static BOOL PBIos_SceneIsLandscape(UIWindowScene* s) {
+    if (s == nil) {
+        return NO;
+    }
+    const UIInterfaceOrientation o = s.interfaceOrientation;
+    const CGSize b = s.coordinateSpace.bounds.size;
+    const BOOL oLand = (o == UIInterfaceOrientationLandscapeLeft || o == UIInterfaceOrientationLandscapeRight);
+    return oLand && b.width >= b.height;
+}
+
+static void PBIos_RequestLandscape(UIWindowScene* scene, UIWindow* w) {
+    UIWindowSceneGeometryPreferencesIOS* prefs =
+        [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
+    [scene requestGeometryUpdateWithPreferences:prefs
+                                   errorHandler:^(NSError* e) {
+                                       NSLog(@"[PaperBoatIosShell] landscape request failed: %@", e);
+                                   }];
+    [w.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
+}
+
+// Glue the game window to its scene and make SDL's whole view chain match it.
+// SDL sets child frames explicitly (no autoresizing), so every ancestor of the
+// metal view is set, then layout runs: the metal view re-derives its
+// drawableSize and SDL's view controller reports RESIZED. Returns YES if it had
+// to fix something.
+static BOOL PBIos_ReconcileGameView(const char* why, BOOL force) {
+    UIView* mv = nil;
+    UIWindow* w = PBIos_GameWindowWithMetal(&mv);
+    if (w == nil || mv == nil) {
+        return NO;
+    }
+    UIWindowScene* scene = w.windowScene;
+    if (scene != nil) {
+        const CGRect sb = scene.coordinateSpace.bounds;
+        if (sb.size.width > 1 && sb.size.height > 1 && !CGRectEqualToRect(w.frame, sb)) {
+            w.frame = sb;
+        }
+    }
+    const CGSize wb = w.bounds.size;
+    if (wb.width < 1 || wb.height < 1) {
+        return NO;
+    }
+    const CGSize vb = mv.bounds.size;
+    const CGSize ds = ((CAMetalLayer*)mv.layer).drawableSize;
+    const float wAspect = (float)(wb.width / wb.height);
+    const BOOL viewOff =
+        vb.width < 1 || vb.height < 1 || fabs(vb.width - wb.width) > 1 || fabs(vb.height - wb.height) > 1;
+    const BOOL drawOff =
+        ds.width < 1 || ds.height < 1 || fabsf((float)(ds.width / ds.height) - wAspect) > wAspect * 0.02f;
+    // The engine's render dims (overlay 0019 publishes mCurDimensions back),
+    // compared by ASPECT: supersampling scales both axes alike.
+    const BOOL engineOff = !PBIos_IsBackgrounded() && gPBIosSsaaW > 0 && gPBIosSsaaH > 0 &&
+                           fabsf((float)gPBIosSsaaW / (float)gPBIosSsaaH - wAspect) > wAspect * 0.05f;
+    if (!force && !viewOff && !drawOff && !engineOff) {
+        return NO;
+    }
+    if (viewOff || drawOff || engineOff) {
+        NSLog(@"[PaperBoatIosShell] reconcile (%s): scene orient=%ld win %.0fx%.0f view %.0fx%.0f drawable "
+              @"%.0fx%.0f engine %ux%u%s%s%s",
+              why, (long)(scene ? scene.interfaceOrientation : 0), wb.width, wb.height, vb.width, vb.height,
+              ds.width, ds.height, gPBIosSsaaW, gPBIosSsaaH, viewOff ? " VIEW" : "", drawOff ? " DRAWABLE" : "",
+              engineOff ? " ENGINE" : "");
+    }
+    for (UIView* v = mv; v != nil && v != (UIView*)w; v = v.superview) {
+        if (!CGRectEqualToRect(v.frame, w.bounds)) {
+            v.frame = w.bounds;
+        }
+    }
+    UIView* root = w.rootViewController.view;
+    [root setNeedsLayout];
+    [root layoutIfNeeded];
+    [mv setNeedsLayout];
+    [mv layoutIfNeeded];
+    PBIos_MarkSafeAreaDirty();
+    return viewOff || drawOff || engineOff;
+}
+
+// Bounded landscape re-assertion. One chain at a time (generation counter); a
+// new heal restarts the budget.
+static int gPBHealGen = 0;
+static int gPBHealActive = 0;
+static UIInterfaceOrientation gPBHealSettledOrient = UIInterfaceOrientationUnknown;
+enum { kPBHealPollMs = 100, kPBHealReaskEvery = 5, kPBHealMaxTicks = 30 };
+
+static void PBIos_HealStep(int gen, int tick, const char* why) {
+    if (gen != gPBHealGen) {
+        return; // superseded
+    }
+    UIView* mv = nil;
+    UIWindow* w = PBIos_GameWindowWithMetal(&mv);
+    UIWindowScene* scene = w ? w.windowScene : PBIos_ActiveWindowScene();
+    if (scene == nil || w == nil) {
+        if (tick < kPBHealMaxTicks) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)kPBHealPollMs * NSEC_PER_MSEC),
+                           dispatch_get_main_queue(), ^{ PBIos_HealStep(gen, tick + 1, why); });
+        } else {
+            gPBHealActive = 0;
+        }
+        return;
+    }
+    if (PBIos_SceneIsLandscape(scene)) {
+        // LiveContainer's per-app Orientation Lock forges the in-process scene
+        // settings to landscape while FrontBoard's real scene can still be
+        // portrait; from the inside that is indistinguishable from a real
+        // landscape scene, so on lifecycle heals (not geometry callbacks or the
+        // tick: no feedback loop) ask FrontBoard for landscape anyway. A no-op
+        // when it already is (Shipwright fdac188).
+        if (tick == 0 && strcmp(why, "didUpdateCoordinateSpace") != 0 &&
+            strcmp(why, "didUpdateEffectiveGeometry") != 0 && strcmp(why, "tick") != 0) {
+            PBIos_RequestLandscape(scene, w);
+        }
+        PBIos_ReconcileGameView(why, tick > 0); // after a rotation: always re-layout once
+        if (tick > 0) {
+            NSLog(@"[PaperBoatIosShell] landscape settled (%s) after %d ms: scene %.0fx%.0f orient=%ld", why,
+                  tick * kPBHealPollMs, scene.coordinateSpace.bounds.size.width,
+                  scene.coordinateSpace.bounds.size.height, (long)scene.interfaceOrientation);
+        }
+        gPBHealSettledOrient = scene.interfaceOrientation;
+        gPBHealActive = 0;
+        return;
+    }
+    // Portrait (or portrait-shaped) scene: keep the game unstretched in the
+    // meantime, and keep asking for landscape.
+    PBIos_ReconcileGameView(why, NO);
+    if (tick % kPBHealReaskEvery == 0) {
+        NSLog(@"[PaperBoatIosShell] scene not landscape (%s, tick %d): orient=%ld bounds %.0fx%.0f -- requesting "
+              @"landscape",
+              why, tick, (long)scene.interfaceOrientation, scene.coordinateSpace.bounds.size.width,
+              scene.coordinateSpace.bounds.size.height);
+        PBIos_RequestLandscape(scene, w);
+    }
+    if (tick < kPBHealMaxTicks) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)kPBHealPollMs * NSEC_PER_MSEC),
+                       dispatch_get_main_queue(), ^{ PBIos_HealStep(gen, tick + 1, why); });
+        return;
+    }
+    NSLog(@"[PaperBoatIosShell] landscape NOT granted (%s) after %d ms: orient=%ld bounds %.0fx%.0f -- rendering "
+          @"unstretched into the portrait scene",
+          why, tick * kPBHealPollMs, (long)scene.interfaceOrientation, scene.coordinateSpace.bounds.size.width,
+          scene.coordinateSpace.bounds.size.height);
+    PBIos_ReconcileGameView(why, YES);
+    gPBHealSettledOrient = scene.interfaceOrientation;
+    gPBHealActive = 0;
+}
+
+static void PBIos_HealOrientation(const char* why) {
+    gPBHealGen++;
+    gPBHealActive = 1;
+    const int gen = gPBHealGen;
+    // Next main-queue turn: callers include scene callbacks that fire
+    // mid-transaction, before SDL's views have been laid out.
+    dispatch_async(dispatch_get_main_queue(), ^{ PBIos_HealStep(gen, 0, why); });
+}
+
+// The touch overlay's 0.25 s tick. Cheap when healthy: one size compare.
+static void PBIos_OrientationTick(void) {
+    if (gPBHealActive || PBIos_IsBackgrounded()) {
+        return;
+    }
+    UIView* mv = nil;
+    UIWindow* w = PBIos_GameWindowWithMetal(&mv);
+    UIWindowScene* scene = w.windowScene;
+    if (scene == nil || mv == nil) {
+        return;
+    }
+    // A portrait scene we have not already given up on (the orientation
+    // changed since the last settle): start a heal. A scene the system keeps
+    // portrait (LiveContainer's per-app lock) is not re-asked forever.
+    if (!PBIos_SceneIsLandscape(scene) && scene.interfaceOrientation != gPBHealSettledOrient) {
+        PBIos_HealOrientation("tick");
+        return;
+    }
+    // Stale view chain / drawable / engine size: two consecutive ticks (0.5 s)
+    // before acting, so a rotation in flight is not interrupted.
+    static int staleTicks = 0;
+    static int missStreak = 0;
+    const CGSize wb = w.bounds.size, vb = mv.bounds.size;
+    const CGSize ds = ((CAMetalLayer*)mv.layer).drawableSize;
+    const float wAspect = wb.height > 0 ? (float)(wb.width / wb.height) : 0;
+    const BOOL off =
+        wAspect > 0 &&
+        (vb.height < 1 || fabs(vb.width - wb.width) > 1 || fabs(vb.height - wb.height) > 1 || ds.height < 1 ||
+         fabsf((float)(ds.width / ds.height) - wAspect) > wAspect * 0.02f ||
+         (gPBIosSsaaH > 0 && fabsf((float)gPBIosSsaaW / (float)gPBIosSsaaH - wAspect) > wAspect * 0.05f));
+    if (!off) {
+        staleTicks = 0;
+        missStreak = 0;
+        return;
+    }
+    // Back off if reconciling does not take (never spin the layout pass or the
+    // log at 4 Hz forever): after 8 straight misses, every 5 s.
+    if (++staleTicks >= 2) {
+        staleTicks = 0;
+        if (missStreak < 8 || (missStreak % 10) == 0) {
+            PBIos_ReconcileGameView("tick", YES);
+        }
+        missStreak++;
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // The graft point. UIKit_ShowWindow() calls -[UIWindow makeKeyAndVisible] on a
@@ -3091,6 +3826,8 @@ static NSString* PBIos_TouchProbe(NSArray<NSString*>* args) {
 - (void)pbios_makeKeyAndVisible {
     PBIos_AdoptWindow(self);
     [self pbios_makeKeyAndVisible]; // swizzled: this is the original
+    // iOS 27 (D37): landscape is self-healing, not a one-shot plist promise.
+    PBIos_HealOrientation("window-created");
     // SDL's window is on screen now: schedule the touch overlay. It waits for
     // pm64.o2r (or an engine with no popup) before it actually appears, so the
     // Torch first-run modals stay tappable.

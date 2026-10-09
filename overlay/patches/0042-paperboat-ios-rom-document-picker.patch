@@ -1,0 +1,84 @@
+Overlay patch 0042 - iOS ROM import through the system document picker.
+
+CLASS: (a) program-baseline parity (every sibling onboards through a picker),
+also (b) an upstream UX bug worth sending. The design notes D42.
+
+THE BUG. Upstream's mobile branch of GameExtractor::SelectGameFromUI has no
+picker: it loads Documents/baserom.us.z64 or fails silently. With no ROM there,
+the first-run prompt "No O2R files found. Generate one now?" -> Yes logs
+"Failed to find ROM at path" and shows the SAME prompt again, forever; the only
+other button exits the app. Nothing tells the user where the ROM has to go, and
+the README promised "pick the .z64 in Files". (Reproduced on the lane-3
+simulator, artifacts/sim/rom-import-2026-10-09/.)
+
+THE FIX.
+1. GameExtractor.cpp: on __IOS__ the branch calls the shell's
+   PBIos_PickRomFile (app/ios/PaperBoatIosShell.m), which presents a
+   UIDocumentPickerViewController and calls back on the main thread with the
+   picked file's path (or NULL on cancel). The result goes through
+   LoadRomFromPath -> onComplete exactly as the desktop picker's does, so
+   RunExtract's existing async contract (PS_WAIT until onComplete) is reused.
+   A cancel returns to the prompt. Android keeps upstream's fixed path.
+2. Engine.cpp: on __IOS__ the "No O2R Files" prompt says what Yes does.
+   A ROM already sitting in Documents is still found first by upstream's
+   PS_LOCAL scan ("ROMs found"), so the old drop-in route keeps working.
+
+Generate against the vendor tree with 0001..0041 applied. Idempotent: an
+already-applied 0042 is reversed in memory first. Every edit asserts its count.
+
+--- a/src/port/extractor/GameExtractor.cpp
++++ b/src/port/extractor/GameExtractor.cpp
+@@ -17,6 +17,11 @@
+ 
+ #include "port/FilePicker.h"
+ 
++#ifdef __IOS__
++// PAPERBOAT_IOS (overlay 0042): app/ios/PaperBoatIosShell.m.
++extern "C" void PBIos_PickRomFile(void (*done)(const char* path, void* user), void* user);
++#endif
++
+ #ifdef __EMSCRIPTEN__
+ #include "port/web/WebUtils.h"
+ #endif
+@@ -123,7 +128,21 @@
+     // Blocks (ASYNCIFY) until the user picks a file or cancels.
+     const std::string romPath = WebFilePicker_PickROM();
+     finish(!romPath.empty() && LoadRomFromPath(romPath));
+-#elif defined(__IOS__) || defined(__ANDROID__)
++#elif defined(__IOS__)
++    // PAPERBOAT_IOS (overlay 0042, D42): the system document picker, presented
++    // by the shell. It answers on a later main-thread run-loop turn (RunExtract
++    // keeps pumping), with the picked file's path or NULL on cancel.
++    auto* pending = new std::function<void(const char*)>([this, finish](const char* path) {
++        finish(path != nullptr && LoadRomFromPath(path));
++    });
++    PBIos_PickRomFile(
++        [](const char* path, void* user) {
++            auto* fn = static_cast<std::function<void(const char*)>*>(user);
++            (*fn)(path);
++            delete fn;
++        },
++        pending);
++#elif defined(__ANDROID__)
+     // Mobile has no file dialog: the ROM is put in place beforehand.
+     finish(LoadRomFromPath(Ship::Context::GetPathRelativeToAppDirectory("baserom.us.z64")));
+ #else
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -621,7 +621,16 @@
+                         promptStep = PS_WEB_CHOICE;
+ #else
+                         PaperboatGui::RegisterPopup(
++#ifdef __IOS__
++                            // PAPERBOAT_IOS (overlay 0042, D42): Yes opens the document picker.
++                            "Paper Mario ROM Needed",
++                            "PaperBoat needs your Paper Mario (USA) ROM (.z64).\n\n"
++                            "Tap Yes and choose it in Files. The game files are\n"
++                            "generated on this device; it takes a few minutes.",
++                            "Yes", "Quit",
++#else
+                             "No O2R Files", "No O2R files found. Generate one now?", "Yes", "No",
++#endif
+                             [&]() { promptStep = PS_LOCAL; },
+                             [&]() {
+                                 threadPool = nullptr;
