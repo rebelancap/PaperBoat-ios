@@ -1,4 +1,28 @@
-Overlay patch 0037 - a real `DeleteTexture`, and a BYTE budget beside the
+Overlay patch 0037 - the texture cache counters (`gPBIosTexCache*`).
+
+REV 3 (upstream 1.0.3 sync, D43): UPSTREAM NOW OWNS THE FREE TOO; THIS PATCH IS
+COUNTERS ONLY. LUS 24486170 ("Bound HD replacement memory, free evicted GPU
+textures, and drop async texture loading") gave `GfxRenderingAPIMetal` a real
+`DeleteTexture` (releases texture, MSAA texture and sampler, then recycles the id
+through a backend free list) and `Interpreter::TextureCacheReleaseDeferred`,
+which hands last frame's evicted ids to `DeleteTexture`. That is rev 2's part 1
+done upstream - with the free deferred a frame, which is stricter than ours - so
+rev 2's Metal `DeleteTexture` body, the Metal byte ledger (`mTextureBytes`,
+`GetTextureBytes`) and the `DeleteTexture` call in `TextureCacheEvictOldest` are
+DROPPED. Keeping our call would now double-free: upstream's deferred release
+would `release()` the same slot a frame later.
+
+What stays is the diagnostic: the four `gPBIosTexCache*` counters read by overlay
+0012's report (the `fps` line's `texcache=` group and the bridge's `texcache`
+verb). `bytes` now reports upstream's interpreter ledger
+(`mTextureCache.resident_bytes`, charged per upload in
+`TextureCacheAccountUpload`) instead of the dropped Metal ledger; `budget_mb` is
+upstream's `mTextureCacheMaxBytes`; `evicts` counts `TextureCacheEvictOldest`
+evictions. CLASS: (a) program-baseline parity (the perf harness).
+
+Rev 2's and rev 1's text follows; it is history.
+
+REV 2/REV 1 TITLE: a real `DeleteTexture`, and a BYTE budget beside the
 1024-entry count cap.
 
 REV 2 (round 26, upstream 1.0.2): UPSTREAM NOW OWNS THE BUDGET; THIS PATCH KEEPS
@@ -116,143 +140,9 @@ one draw.
 The counters (`gPBIosTexCache*`) are read by overlay 0012's report - the `fps`
 line's `texcache=` group and the bridge's `texcache` verb.
 
---- a/external/libultraship/include/fast/backends/gfx_rendering_api.h
-+++ b/external/libultraship/include/fast/backends/gfx_rendering_api.h
-@@ -161,6 +161,13 @@
-     // as TEXEL1 needs it on tile 1.
-     virtual void SelectTextureFb(int fbId, int tile) = 0;
-     virtual void DeleteTexture(uint32_t texId) = 0;
-+    // OVERLAY 0037: total bytes of live GPU textures created through
-+    // UploadTexture/UploadTextureMip. A backend without accounting reports 0,
-+    // which disables the interpreter's byte-budget eviction entirely - so this
-+    // is additive for every backend but Metal.
-+    virtual size_t GetTextureBytes() {
-+        return 0;
-+    }
-     virtual void SetTextureFilter(FilteringMode mode) = 0;
-     virtual FilteringMode GetTextureFilter() = 0;
-     virtual ImTextureID GetTextureById(int id) = 0;
---- a/external/libultraship/include/fast/backends/gfx_metal.h
-+++ b/external/libultraship/include/fast/backends/gfx_metal.h
-@@ -192,6 +192,7 @@
-     void* GetFramebufferTextureId(int fbId) override;
-     void SelectTextureFb(int fbId, int tile) override;
-     void DeleteTexture(uint32_t texId) override;
-+    size_t GetTextureBytes() override; // OVERLAY 0037
-     void SetTextureFilter(FilteringMode mode) override;
-     FilteringMode GetTextureFilter() override;
-     ImTextureID GetTextureById(int id) override;
-@@ -220,6 +221,11 @@
-         mShaderProgramPool;
- 
-     std::vector<struct TextureDataMetal> mTextures;
-+    // OVERLAY 0037: exact resident bytes of the textures above, maintained by
-+    // UploadTexture / UploadTextureMip / DeleteTexture. Framebuffer attachments
-+    // are NOT counted - they are not cache entries and evicting cannot free
-+    // them.
-+    size_t mTextureBytes = 0;
-     std::vector<FramebufferMetal> mFramebuffers;
-     FrameUniforms mFrameUniforms = {};
-     CoordUniforms mCoordUniforms = {};
---- a/external/libultraship/src/fast/backends/gfx_metal.cpp
-+++ b/external/libultraship/src/fast/backends/gfx_metal.cpp
-@@ -346,9 +346,54 @@
-     return (uint32_t)(mTextures.size() - 1);
- }
- 
-+// OVERLAY 0037: the bytes one slot's texture occupies. A mip chain adds one
-+// third over the base level (sum of 1/4^n), which is what the allocator charges.
-+static size_t PbMetalTextureBytes(MTL::Texture* tex) {
-+    if (tex == nullptr) {
-+        return 0;
-+    }
-+    size_t bytes = (size_t)tex->width() * (size_t)tex->height() * 4;
-+    if (tex->mipmapLevelCount() > 1) {
-+        bytes += bytes / 3;
-+    }
-+    return bytes;
-+}
-+
- void GfxRenderingAPIMetal::DeleteTexture(uint32_t texID) {
-+    // OVERLAY 0037: this was an EMPTY FUNCTION, so cache eviction never freed a
-+    // byte of GPU memory - the MTLTexture stayed resident until its id was
-+    // reused by a texture of different dimensions. Releasing here is safe even
-+    // mid-frame: Metal command buffers retain the resources their encoders
-+    // reference until completion, and this fork additionally defers the ID
-+    // recycling by a frame (deferred_free_texture_ids).
-+    if (texID >= mTextures.size()) {
-+        return;
-+    }
-+    TextureDataMetal* texture_data = &mTextures[texID];
-+    if (texture_data->texture != nullptr) {
-+        const size_t bytes = PbMetalTextureBytes(texture_data->texture);
-+        mTextureBytes = bytes > mTextureBytes ? 0 : mTextureBytes - bytes;
-+        texture_data->texture->release();
-+        texture_data->texture = nullptr;
-+    }
-+    if (texture_data->msaaTexture != nullptr) {
-+        texture_data->msaaTexture->release();
-+        texture_data->msaaTexture = nullptr;
-+    }
-+    // The sampler is recreated by SetSamplerParameters, which TextureCacheLookup
-+    // calls for every entry it admits, so dropping it here cannot leave a slot
-+    // without one.
-+    if (texture_data->sampler != nullptr) {
-+        texture_data->sampler->release();
-+        texture_data->sampler = nullptr;
-+    }
-+    texture_data->mip_levels = 0;
- }
- 
-+size_t GfxRenderingAPIMetal::GetTextureBytes() {
-+    return mTextureBytes;
-+}
-+
- void GfxRenderingAPIMetal::SelectTexture(int tile, uint32_t texture_id) {
-     mCurrentTile = tile;
-     mCurrentTextureIds[tile] = texture_id;
-@@ -375,10 +420,15 @@
-     MTL::Texture* texture = texture_data->texture;
-     if (texture_data->texture == nullptr || texture_data->texture->width() != width ||
-         texture_data->texture->height() != height || texture_data->texture->mipmapLevelCount() != 1) {
--        if (texture_data->texture != nullptr)
-+        if (texture_data->texture != nullptr) {
-+            // OVERLAY 0037: debit the ledger for the texture being thrown away.
-+            const size_t pbOld = PbMetalTextureBytes(texture_data->texture);
-+            mTextureBytes = pbOld > mTextureBytes ? 0 : mTextureBytes - pbOld;
-             texture_data->texture->release();
-+        }
- 
-         texture = mDevice->newTexture(texture_descriptor);
-+        mTextureBytes += (size_t)width * (size_t)height * 4; // OVERLAY 0037
-     }
- 
-     NS::UInteger bytes_per_pixel = 4;
-@@ -404,8 +454,12 @@
-     if (level == 0) {
-         if (texture_data->texture == nullptr || texture_data->texture->width() != width ||
-             texture_data->texture->height() != height || texture_data->texture->mipmapLevelCount() != totalLevels) {
--            if (texture_data->texture != nullptr)
-+            if (texture_data->texture != nullptr) {
-+                // OVERLAY 0037: same debit as UploadTexture's.
-+                const size_t pbOld = PbMetalTextureBytes(texture_data->texture);
-+                mTextureBytes = pbOld > mTextureBytes ? 0 : mTextureBytes - pbOld;
-                 texture_data->texture->release();
-+            }
- 
-             MTL::TextureDescriptor* texture_descriptor =
-                 MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, true);
-@@ -414,6 +468,7 @@
-             texture_descriptor->setSampleCount(1);
-             texture_descriptor->setStorageMode(MTL::StorageModeShared);
-             texture_data->texture = mDevice->newTexture(texture_descriptor);
-+            mTextureBytes += PbMetalTextureBytes(texture_data->texture); // OVERLAY 0037
-         }
-         texture_data->mip_levels = totalLevels;
-         texture_data->auto_mipmaps = mNextTextureAutoMipmap;
 --- a/external/libultraship/include/fast/interpreter.h
 +++ b/external/libultraship/include/fast/interpreter.h
-@@ -670,6 +670,10 @@
+@@ -672,6 +672,10 @@
      RenderingState mRenderingState{};
  
      GfxTextureCache mTextureCache{};
@@ -262,13 +152,14 @@ line's `texcache=` group and the bridge's `texcache` verb.
 +    uint32_t mPbTexLookups = 0;
      size_t mTextureCacheMaxSize = 0;
      size_t mTextureCacheMaxBytes = 0;
-     void TextureCacheEvictOldest();
+     size_t mFramebufferBytes = 0; // video memory the framebuffers take, estimated each frame
 --- a/external/libultraship/src/fast/interpreter.cpp
 +++ b/external/libultraship/src/fast/interpreter.cpp
-@@ -1044,7 +1044,30 @@
-     return rm->LoadResource(name, /*loadExact=*/true);
+@@ -1148,8 +1148,31 @@
+     }
+     return Ship::Context::GetRawInstance()->GetResourceManager()->LoadResource(path, /*loadExact=*/true);
  }
- 
++
 +// OVERLAY 0037: the texture cache's own ledger, read by overlay 0012's report
 +// (the `fps` line's `texcache=` group and the bridge's `texcache` verb).
 +// Written and read on the main thread (the render thread; the game runs on its
@@ -282,32 +173,25 @@ line's `texcache=` group and the bridge's `texcache` verb.
 +extern "C" volatile uint64_t gPBIosTexCacheBytes = 0;
 +extern "C" volatile uint32_t gPBIosTexCacheEntries = 0;
 +extern "C" volatile uint32_t gPBIosTexCacheBudgetMB = 0;
-+
+ 
  bool Interpreter::TextureCacheLookup(int i, const TextureCacheKey& key) {
 +    // OVERLAY 0037: republish the ledger every 512 lookups, HIT OR MISS - a
 +    // fraction of a second - so `texcache` does not go stale in a scene that is
-+    // fully cached. The budget is upstream's (Settings > Graphics > Texture
-+    // Cache); `bytes` is the Metal backend's exact resident total.
++    // fully cached. Budget and bytes are upstream's own (Settings > Graphics >
++    // Texture Cache; the interpreter's per-upload ledger).
 +    if ((mPbTexLookups++ % 512) == 0) {
 +        gPBIosTexCacheEntries = (uint32_t)mTextureCache.map.size();
-+        gPBIosTexCacheBytes = (uint64_t)mRapi->GetTextureBytes();
++        gPBIosTexCacheBytes = (uint64_t)mTextureCache.resident_bytes;
 +        gPBIosTexCacheBudgetMB = (uint32_t)(mTextureCacheMaxBytes / (1024 * 1024));
 +    }
      TextureCacheMap::iterator it = mTextureCache.map.find(key);
      TextureCacheNode** n = &mRenderingState.mTextures[i];
  
-@@ -1102,6 +1125,14 @@
+@@ -1206,6 +1229,7 @@
+         return;
      }
-     mGfxCacheStats.evictions++;
      TextureCacheMap::iterator it = lruIt->it;
-+    // OVERLAY 0037: actually free the evicted texture. Without this the Metal
-+    // backend keeps the MTLTexture (DeleteTexture was an empty body, and nothing
-+    // here called it) until the id is recycled at different dimensions, so the
-+    // byte budget above bounded the ledger, not the GPU memory. Safe mid-frame:
-+    // command buffers retain what their encoders reference, the id recycling is
-+    // deferred a frame, and bound entries are never chosen (the loop above).
-+    mRapi->DeleteTexture(it->second.texture_id);
-+    gPBIosTexCacheEvicts++;
++    gPBIosTexCacheEvicts++; // OVERLAY 0037
      mTextureCache.deferred_free_texture_ids.push_back(it->second.texture_id);
      mTextureCache.resident_bytes -= std::min(mTextureCache.resident_bytes, it->second.bytes);
      mTextureCache.map.erase(it);

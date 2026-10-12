@@ -540,7 +540,7 @@ Every hunk keeps clear of earlier patches' hunks and their 3-line contexts
  void Fast3dWindow::SetCursorVisibility(bool visible) {
 --- a/external/libultraship/src/fast/backends/gfx_metal.cpp
 +++ b/external/libultraship/src/fast/backends/gfx_metal.cpp
-@@ -137,10 +137,28 @@
+@@ -97,10 +97,28 @@
  
  static void SetupScreenFramebuffer(uint32_t width, uint32_t height);
  
@@ -569,7 +569,7 @@ Every hunk keeps clear of earlier patches' hunks and their 3-line contexts
  
      MTL::RenderPassDescriptor* current_render_pass = mFramebuffers[0].mRenderPassDescriptor;
      ImGui_ImplMetal_NewFrame(current_render_pass);
-@@ -1944,6 +1962,15 @@
+@@ -1459,6 +1477,15 @@
  }
  
  void GfxRenderingAPIMetal::ReadFramebufferToCPU(int fb_id, uint32_t width, uint32_t height, uint16_t* rgba16_buf) {
@@ -587,7 +587,7 @@ Every hunk keeps clear of earlier patches' hunks and their 3-line contexts
      }
 --- a/external/libultraship/src/fast/backends/gfx_sdl2.cpp
 +++ b/external/libultraship/src/fast/backends/gfx_sdl2.cpp
-@@ -904,6 +904,13 @@
+@@ -869,6 +869,13 @@
      previous_time = t;
  }
  
@@ -601,7 +601,7 @@ Every hunk keeps clear of earlier patches' hunks and their 3-line contexts
  void GfxWindowBackendSDL2::SwapBuffersBegin() {
      bool nextVsyncEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(CVAR_VSYNC_ENABLED, 1);
  
-@@ -913,7 +920,13 @@
+@@ -878,7 +885,13 @@
          SDL_RenderSetVSync(mRenderer, mVsyncEnabled ? 1 : 0);
      }
  
@@ -792,7 +792,7 @@ Every hunk keeps clear of earlier patches' hunks and their 3-line contexts
  MtxF sInterpolationMatrixStack[0x1000];
  MtxF* gInterpolationMatrix = &sInterpolationMatrixStack[0];
  
-@@ -165,7 +173,13 @@
+@@ -143,7 +151,13 @@
      while (wnd->IsRunning()) {
          ThreadWatchdog_Beat(WATCHDOG_MAIN_LOOP);
          GameEngine::Instance->StartFrame();
@@ -806,7 +806,7 @@ Every hunk keeps clear of earlier patches' hunks and their 3-line contexts
          GameEngine::DrainRenderService();
          if (!ServiceRcp()) {
              if (ThreadWatchdog_IsStalled(WATCHDOG_GAME_TICK)) {
-@@ -173,7 +187,13 @@
+@@ -151,7 +165,13 @@
                  SDL_Delay(16);
                  continue;
              }

@@ -171,7 +171,7 @@ Menu.cpp is touched by no other patch in the series.
  namespace Ship {
  std::string disabledTempTooltip;
  const char* disabledTooltip;
-@@ -815,6 +902,13 @@
+@@ -820,6 +907,13 @@
      options4.tooltip = option4Tooltip.c_str();
      if (UIWidgets::Button(ICON_FA_QUESTION_CIRCLE, options4)) {
      }
@@ -185,7 +185,7 @@ Menu.cpp is touched by no other patch in the series.
      ImGui::SameLine();
      UIWidgets::ButtonOptions options3 = {};
      options3.color = UIWidgets::Colors::Red;
-@@ -834,6 +928,7 @@
+@@ -839,6 +933,7 @@
              nullptr
          );
      }
@@ -193,7 +193,7 @@ Menu.cpp is touched by no other patch in the series.
      ImGui::PopStyleVar();
      ImGui::SameLine();
      UIWidgets::ButtonOptions options2 = {};
-@@ -905,6 +1000,9 @@
+@@ -910,6 +1005,9 @@
          ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize,
          ImGuiWindowFlags_NoTitleBar
      );
@@ -203,7 +203,7 @@ Menu.cpp is touched by no other patch in the series.
      for (auto& sidebarLabel : menuEntries.at(headerIndex).sidebarOrder) {
          std::string nextIndex = "";
          UIWidgets::PushStyleButton(menuThemeIndex);
-@@ -953,6 +1051,9 @@
+@@ -958,6 +1056,9 @@
              sectionMenuId.c_str(), { sectionWidth, windowHeight * 4 }, ImGuiChildFlags_AutoResizeY,
              ImGuiWindowFlags_NoTitleBar
          );
@@ -213,7 +213,7 @@ Menu.cpp is touched by no other patch in the series.
      }
      if (headerSearch && menuSearchText.length() > 0) {
          ImGui::AlignTextToFramePadding();
-@@ -994,6 +1095,9 @@
+@@ -999,6 +1100,9 @@
                      sectionId.c_str(), { columnWidth, windowHeight * 4 }, ImGuiChildFlags_AutoResizeY,
                      ImGuiWindowFlags_NoTitleBar
                  );

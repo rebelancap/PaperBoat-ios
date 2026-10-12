@@ -11,12 +11,12 @@ VENDOR="$ROOT/vendor/PaperBoat"
 
 # --- D0 pins (see the design notes) ---------------------------------------------
 PB_REPO="https://github.com/HarbourMasters/PaperBoat.git"
-# Upstream tag 1.0.2 ("Mulberry Charlie 1.0.2"; lightweight tag). Was 1.0.0
-# (5489baad) until round 26. LUS is JeodC/libultraship branch lus-converge;
+# Upstream tag 1.0.3 ("Mulberry Delta 1.0.3"). Was 1.0.2 (b721efd6) until the
+# 1.0.3 sync (D43), 1.0.0 (5489baad) until round 26. LUS is JeodC/libultraship branch lus-converge;
 # Torch moved from JeodC/Torch-LH (pm64) to HarbourMasters/Torch (main) in
 # upstream d60b803f5, which is why the submodule URLs are re-synced below.
-PB_PIN="b721efd6b5ad6dce9cdef25a6b93b2fdc8b04309"
-LUS_PIN="3e3cd2ed5ac1f85b79b50ec184fb5c09140046c4"
+PB_PIN="7f038b8552b1bf5c297a5fd06738d8f245851833"
+LUS_PIN="7f1bd60e9442d83acd3bee00c9d8a07270d0777e"
 TORCH_PIN="72960ca16f4723f96aaf4037b76072c230af8c11"
 
 die() { printf '\033[31mFATAL:\033[0m %s\n' "$*" >&2; exit 1; }

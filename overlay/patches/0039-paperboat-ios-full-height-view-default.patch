@@ -48,7 +48,7 @@ Match-count asserted against the pristine vendor state.
 
 --- a/src/port/patches/CameraPatches.cpp
 +++ b/src/port/patches/CameraPatches.cpp
-@@ -136,8 +136,18 @@
+@@ -137,8 +137,18 @@
  
  // FULL HEIGHT VIEW
  
@@ -70,7 +70,7 @@ Match-count asserted against the pristine vendor state.
  static bool cam_is_full_height_rect(s32 x, s32 y, s32 w, s32 h) {
 --- a/src/port/ui/PaperboatMenuEnhancements.cpp
 +++ b/src/port/ui/PaperboatMenuEnhancements.cpp
-@@ -106,7 +106,14 @@
+@@ -110,7 +110,14 @@
      AddWidget(path, "Full Height View", WIDGET_CVAR_CHECKBOX)
          .CVar(CVAR_ENHANCEMENT("Graphics.FullHeightView"))
          .Options(

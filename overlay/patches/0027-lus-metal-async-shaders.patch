@@ -404,7 +404,7 @@ already carry, plus the ownership fix they all still need.
      NS::Error* error = nullptr;
      MTL::Library* library =
          mDevice->newLibrary(NS::String::string(buf.data(), NS::UTF8StringEncoding), nullptr, &error);
-@@ -314,6 +540,7 @@
+@@ -315,6 +541,7 @@
      autorelease_pool->release();
  
      return (struct ShaderProgram*)prg;
@@ -412,7 +412,7 @@ already carry, plus the ownership fix they all still need.
  }
  
  struct ShaderProgram* GfxRenderingAPIMetal::LookupShader(uint64_t shader_id0, uint64_t shader_id1) {
-@@ -326,9 +553,16 @@
+@@ -327,9 +554,16 @@
      struct ShaderProgramMetal* prg = &it->second;
  
      if (prg->markedForDeletion) {
@@ -429,7 +429,7 @@ already carry, plus the ownership fix they all still need.
  
      return it == mShaderProgramPool.end() ? nullptr : (struct ShaderProgram*)&it->second;
  }
-@@ -692,10 +926,28 @@
+@@ -715,10 +949,28 @@
      current_framebuffer.mCommandEncoder->setCullMode(cull);
  
      if (current_framebuffer.mLastShaderProgram != mShaderProgram) {

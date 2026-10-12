@@ -46,7 +46,7 @@ Measured motivation: the design notes D28 §2 / D29, and the user's device read 
 
 --- a/external/libultraship/src/fast/backends/gfx_metal.cpp
 +++ b/external/libultraship/src/fast/backends/gfx_metal.cpp
-@@ -918,7 +918,14 @@
+@@ -941,7 +941,14 @@
      }
  
      render_pass_descriptor->depthAttachment()->setTexture(fb.mDepthTexture);

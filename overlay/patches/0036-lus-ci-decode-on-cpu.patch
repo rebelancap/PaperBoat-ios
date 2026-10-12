@@ -110,6 +110,18 @@ coexist and a mid-session flip is safe. Diagnostic only - deliberately NOT in
 Settings > iOS. It exists so a device read can price the change in one line
 instead of two builds.
 
+REV 4 (upstream 1.0.3 sync, D43): re-anchored, one behavioural guard. LUS
+24486170 dropped async texture loading, so the per-frame latches now sit beside
+the DitherNoise latch in Run() (header: beside `mRgbDitherEnabled`). LUS
+f6285a97/7f1bd60e gave TextureCacheKey a `palette_variant` (an HD replacement
+drawn through a run-time palette mix or tint, `TilePaletteVariantId`), set on
+the NON-indexed path, which nulls the palette addresses itself. The content
+hash now applies only when `palette_variant == 0`, so upstream's HD variant
+keying is left exactly as upstream wrote it; `palette_hash` sits after
+`palette_variant` in the key. Upstream drawing HD palette variants without the
+indexed path also retires most of rev 3's caveat below: HD mixes/tints now work
+with `gSohIos.PaletteInShader` at 0 (not verified with a pack in this sync).
+
 REV 3 (round 26, upstream 1.0.2): context only. LUS 3e3cd2ed's
 TextureCacheKey grew `indexed = 2` (an HD replacement's silhouette drawn as
 indices, `gDPPaletteMask`) and a `mask[2]` member; `palette_hash` now follows
@@ -176,43 +188,43 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
 
 --- a/external/libultraship/include/fast/interpreter.h
 +++ b/external/libultraship/include/fast/interpreter.h
-@@ -224,6 +224,13 @@
-     // the entries its opaque and transparent pixels read.
-     uint8_t indexed;
+@@ -227,6 +227,14 @@
      uint8_t mask[2];
+     // The HD palette mix or shift a CI tile was drawn through; 0 for none.
+     uint32_t palette_variant;
 +    // PAPERBOAT (overlay 0036 rev 2): FNV-1a over exactly the TLUT bytes a CPU
 +    // decode reads (32 for a CI4 bank, 512 for CI8's two halves). Non-zero
 +    // REPLACES palette_addrs/palette_index in the key for a CPU-decoded CI
 +    // entry: the same raster through the same palette CONTENTS is one entry
 +    // whatever address the TLUT was loaded from, which is what makes PM64's
-+    // run-time shading-palette ring cheap. 0 for every other entry.
++    // run-time shading-palette ring cheap. 0 for every other entry, including
++    // an entry upstream keys on palette_variant (rev 4).
 +    uint64_t palette_hash;
  
      bool operator==(const TextureCacheKey&) const noexcept = default;
  
-@@ -565,6 +572,10 @@
-     GfxCacheStats ConsumeGfxCacheStats();
-     std::shared_ptr<Ship::IResource> ResolveResourceCached(const char* path);
+@@ -561,6 +569,10 @@
+     size_t GetReplacementMemoryBudgetBytes() const;
+     size_t GetReplacementMemoryBytes() const;
      bool TextureCacheLookup(int i, const TextureCacheKey& key);
 +    // PAPERBOAT (overlay 0036 rev 2): hash of the TLUT bytes this tile's CPU
 +    // decode will read; 0 when the palette is not available, in which case the
 +    // key falls back to the DRAM-address form exactly as before.
 +    uint64_t PbPaletteContentHash(uint8_t siz, uint8_t paletteIndex) const;
      void TextureCacheDelete(const uint8_t* origAddr);
+     void TextureCacheDeleteRanges(std::vector<std::pair<const uint8_t*, size_t>>& ranges);
      void TextureCacheDeleteByPalette(const uint8_t* palAddr);
-     void TextureCacheDrop(int i);
-@@ -863,7 +874,28 @@
-     // shown because the HD upload was deferred (red). 0 = no replacement / no tint.
-     bool mTextureReplacementDebug = false;
-     int mDebugTintState = 0;
-+
+@@ -845,6 +857,27 @@
+     int mInterpolationTotal{};
+     float mInterpolationFrac{};
+     // N64 RGB framebuffer dither (G_CD_*), applied per-draw in the fragment shader.
 +    // PAPERBOAT (overlay 0036): GPU palettization is a runtime choice, not the only
 +    // path. Latched once per frame in Run() from `gSohIos.PaletteInShader`; at its
 +    // default 0 no tile is palettized, the TEXEL*_PALETTE shader bits are never set,
 +    // `paletteSample` is not emitted into the generated shader at all, and every CI
 +    // tile takes the CPU decode this file already has for masked/blended/mip tiles.
 +    bool mPaletteInShader = false;
- 
++
 +    // REV 2: content-hash the TLUT into the cache key (default 1). The A/B
 +    // lever for rev 2 on its own: at 0 a CPU-decoded CI entry keys on the
 +    // palette's DRAM ADDRESS, which is rev 1 exactly, so `tex_up_n` can be read
@@ -227,12 +239,12 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
 +    // the walk, never a reason to skip a deletion that might be needed.
 +    uint32_t mPbPaletteAddrKeyed = 0;
 +
-     // Async texture loading (gEnhancements.Graphics.AsyncTextureLoad). When on (and alt
-     // assets enabled), a texture's HD/replacement resource is decoded on the resource
-     // thread pool while the cheap vanilla version renders; the HD swaps in once its load
+     // Cached once per frame from the gEnhancements.Graphics.DitherNoise CVar.
+     bool mRgbDitherEnabled = true;
+ 
 --- a/external/libultraship/src/fast/interpreter.cpp
 +++ b/external/libultraship/src/fast/interpreter.cpp
-@@ -1069,6 +1069,11 @@
+@@ -1174,6 +1174,11 @@
      }
  
      it = mTextureCache.map.insert(std::make_pair(key, TextureCacheValue())).first;
@@ -244,10 +256,12 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
      TextureCacheNode* node = &*it;
      node->second.texture_id = texture_id;
      node->second.bytes = 0;
-@@ -1312,11 +1317,70 @@
+@@ -1581,6 +1586,57 @@
+     mTextureCache.lru.erase(node->second.lru_location);
+     mTextureCache.map.erase(node->first);
      mRenderingState.mTextures[i] = nullptr;
- }
- 
++}
++
 +// OVERLAY 0036 REV 2: a hash of exactly the TLUT bytes this tile's CPU decode
 +// will read - the 32-byte bank ImportTextureCi4 selects with palIdx, or CI8's
 +// two 256-byte halves. FNV-1a over at most 512 L1-resident bytes; the length is
@@ -297,10 +311,10 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
 +    pbHash ^= (uint64_t)pbLens[0] | ((uint64_t)pbLens[1] << 32);
 +    pbHash *= 1099511628211ull;
 +    return pbHash == 0 ? 1ull : pbHash; // 0 is reserved for "no hash"
-+}
-+
+ }
+ 
  // Invalidate cache entries whose key references the given palette DRAM addr.
- // The freed texture ids are recycled on the *next* frame (deferred_free_texture_ids):
+@@ -1588,6 +1644,14 @@
  // reusing them in this frame would let a deferred backend's command encoder
  // (Metal/Vulkan/D3D) sample the later draw's re-uploaded content from an earlier draw.
  void Interpreter::TextureCacheDeleteByPalette(const uint8_t* palAddr) {
@@ -315,10 +329,12 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
      for (auto it = mTextureCache.map.begin(); it != mTextureCache.map.end();) {
          if (it->first.palette_addrs[0] == palAddr || it->first.palette_addrs[1] == palAddr) {
              for (int j = 0; j < SHADER_MAX_TEXTURES; j++) {
-@@ -2873,6 +2937,24 @@
-         key = { origAddr, {}, fmt, siz, paletteIndex, origSizeBytes };
-     }
-     key.mip_levels = mCurrentMipExtraLevels;
+@@ -3128,6 +3192,25 @@
+             key.palette_addrs[0] = nullptr;
+             key.palette_addrs[1] = nullptr;
+             key.palette_index = 0;
++        }
++    }
 +    // OVERLAY 0036 REV 2: a CPU-decoded CI entry keys on the TLUT's CONTENTS.
 +    // The address form above is correct but far too fine: PM64's sprite shading
 +    // writes an identical two-tone palette into a different slot of a 512-entry
@@ -327,20 +343,19 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
 +    // than adding to them - is what turns the ring into one entry;
 +    // palette_index goes too, since the hash already covers the exact bank it
 +    // selects. A 0 hash means the palette was not available, and the key stays
-+    // exactly as it was.
-+    if (fmt == G_IM_FMT_CI && !mImportIndexed && mPaletteKeyByContent) {
++    // exactly as it was. Rev 4: not when upstream keyed the tile on an HD
++    // palette variant (palette_variant != 0) - that key is upstream's own.
++    if (fmt == G_IM_FMT_CI && !mImportIndexed && mPaletteKeyByContent && key.palette_variant == 0) {
 +        const uint64_t pbPalHash = PbPaletteContentHash(siz, paletteIndex);
 +        if (pbPalHash != 0) {
 +            key.palette_addrs[0] = nullptr;
 +            key.palette_addrs[1] = nullptr;
 +            key.palette_index = 0;
 +            key.palette_hash = pbPalHash;
-+        }
-+    }
+         }
+     }
      if (mImportIndexed) {
-         // Index textures don't depend on palette contents: the palette lookup
-         // happens in the shader, so TLUT swaps reuse the same cache entry.
-@@ -3492,7 +3574,15 @@
+@@ -3724,7 +3807,15 @@
      mDebugTintState = 0;
  
      bool palettized[2] = { false, false };
@@ -357,9 +372,9 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
          uint32_t pal_tile = mRdp->first_tile_index + i;
          if (i == 1 && mRdp->first_tile_index >= 2) {
              pal_tile = mRdp->first_tile_index;
-@@ -7667,6 +7757,23 @@
-     mAsyncTextureLoad = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
-                             "gEnhancements.Graphics.AsyncTextureLoad", 0) != 0;
+@@ -7884,6 +7975,23 @@
+     mRgbDitherEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                             "gEnhancements.Graphics.DitherNoise", 0) != 0;
  
 +    // OVERLAY 0036: do the CI4/CI8 palette lookup in the FRAGMENT SHADER? Default no.
 +    // The shader path costs a dependent texture tap per filter tap - three under PM64's
@@ -378,6 +393,6 @@ keying), so the two keyings are one binary apart, like rev 1's own lever.
 +    mPaletteKeyByContent = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
 +                               "gSohIos.PaletteKeyByContent", 1) != 0;
 +
-     // Engine built-in custom uniform registers (see CustomUniforms):
-     // [0] = frame count / elapsed seconds / delta seconds, [1] = fb dimensions
-     {
+     // Start queued prefetches, then trim decoded HD textures to budget before drawing.
+     mHdFrame++;
+     std::vector<PrefetchRequest> prefetchRequests;

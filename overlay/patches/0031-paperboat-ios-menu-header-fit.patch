@@ -69,7 +69,7 @@ Match-count asserted against the pristine vendor state.
 
 --- a/src/port/ui/Menu.cpp
 +++ b/src/port/ui/Menu.cpp
-@@ -734,10 +734,24 @@
+@@ -739,10 +739,24 @@
      float headerHeight = headerSizes.at(0).y + style.FramePadding.y * 2;
      ImVec2 buttonSize = ImGui::CalcTextSize(ICON_FA_TIMES_CIRCLE) + style.FramePadding * 2;
      bool scrollbar = false;
@@ -94,7 +94,7 @@ Match-count asserted against the pristine vendor state.
      ImGui::SetNextWindowSizeConstraints({ 0, headerHeight }, { headerWidth, headerHeight });
      ImVec2 headerSelSize = { menuSize.x - buttonSize.x * 3 - style.ItemSpacing.x * 3, headerHeight };
      if (scrollbar) {
-@@ -747,7 +761,12 @@
+@@ -752,7 +766,12 @@
      ImGui::BeginChild(
          "Header Selection", headerSelSize,
          ImGuiChildFlags_AutoResizeX | ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_AlwaysAutoResize,

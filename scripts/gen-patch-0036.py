@@ -111,6 +111,18 @@ coexist and a mid-session flip is safe. Diagnostic only - deliberately NOT in
 Settings > iOS. It exists so a device read can price the change in one line
 instead of two builds.
 
+REV 4 (upstream 1.0.3 sync, D43): re-anchored, one behavioural guard. LUS
+24486170 dropped async texture loading, so the per-frame latches now sit beside
+the DitherNoise latch in Run() (header: beside `mRgbDitherEnabled`). LUS
+f6285a97/7f1bd60e gave TextureCacheKey a `palette_variant` (an HD replacement
+drawn through a run-time palette mix or tint, `TilePaletteVariantId`), set on
+the NON-indexed path, which nulls the palette addresses itself. The content
+hash now applies only when `palette_variant == 0`, so upstream's HD variant
+keying is left exactly as upstream wrote it; `palette_hash` sits after
+`palette_variant` in the key. Upstream drawing HD palette variants without the
+indexed path also retires most of rev 3's caveat below: HD mixes/tints now work
+with `gSohIos.PaletteInShader` at 0 (not verified with a pack in this sync).
+
 REV 3 (round 26, upstream 1.0.2): context only. LUS 3e3cd2ed's
 TextureCacheKey grew `indexed = 2` (an HD replacement's silhouette drawn as
 indices, `gDPPaletteMask`) and a `mask[2]` member; `palette_hash` now follows
@@ -185,7 +197,8 @@ LUS = "external/libultraship"
 EDITS = []
 
 # ------------------------------------------------- include/fast/interpreter.h
-H_OLD = """    // Async texture loading (gEnhancements.Graphics.AsyncTextureLoad). When on (and alt
+H_OLD = """    // Cached once per frame from the gEnhancements.Graphics.DitherNoise CVar.
+    bool mRgbDitherEnabled = true;
 """
 H_NEW = """    // PAPERBOAT (overlay 0036): GPU palettization is a runtime choice, not the only
     // path. Latched once per frame in Run() from `gSohIos.PaletteInShader`; at its
@@ -194,7 +207,8 @@ H_NEW = """    // PAPERBOAT (overlay 0036): GPU palettization is a runtime choic
     // tile takes the CPU decode this file already has for masked/blended/mip tiles.
     bool mPaletteInShader = false;
 
-    // Async texture loading (gEnhancements.Graphics.AsyncTextureLoad). When on (and alt
+    // Cached once per frame from the gEnhancements.Graphics.DitherNoise CVar.
+    bool mRgbDitherEnabled = true;
 """
 
 # REV 2: the cache key carries a hash of the TLUT CONTENTS, so the 512-entry ring
@@ -207,6 +221,8 @@ H_KEY_OLD = """    // 1 = uploaded as a CI index texture (palette applied in the
     // the entries its opaque and transparent pixels read.
     uint8_t indexed;
     uint8_t mask[2];
+    // The HD palette mix or shift a CI tile was drawn through; 0 for none.
+    uint32_t palette_variant;
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
 """
@@ -216,12 +232,15 @@ H_KEY_NEW = """    // 1 = uploaded as a CI index texture (palette applied in the
     // the entries its opaque and transparent pixels read.
     uint8_t indexed;
     uint8_t mask[2];
+    // The HD palette mix or shift a CI tile was drawn through; 0 for none.
+    uint32_t palette_variant;
     // PAPERBOAT (overlay 0036 rev 2): FNV-1a over exactly the TLUT bytes a CPU
     // decode reads (32 for a CI4 bank, 512 for CI8's two halves). Non-zero
     // REPLACES palette_addrs/palette_index in the key for a CPU-decoded CI
     // entry: the same raster through the same palette CONTENTS is one entry
     // whatever address the TLUT was loaded from, which is what makes PM64's
-    // run-time shading-palette ring cheap. 0 for every other entry.
+    // run-time shading-palette ring cheap. 0 for every other entry, including
+    // an entry upstream keys on palette_variant (rev 4).
     uint64_t palette_hash;
 
     bool operator==(const TextureCacheKey&) const noexcept = default;
@@ -261,13 +280,11 @@ EDITS.append((f"{LUS}/include/fast/interpreter.h",
 
 # ------------------------------------------------- src/fast/interpreter.cpp
 # 1. the per-frame latch, next to the other per-frame CVar latches in Run().
-CPP_LATCH_OLD = """    // Async texture loading: decode HD/replacement textures off-thread, render vanilla until ready.
-    mAsyncTextureLoad = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
-                            "gEnhancements.Graphics.AsyncTextureLoad", 0) != 0;
+CPP_LATCH_OLD = """    mRgbDitherEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                            "gEnhancements.Graphics.DitherNoise", 0) != 0;
 """
-CPP_LATCH_NEW = """    // Async texture loading: decode HD/replacement textures off-thread, render vanilla until ready.
-    mAsyncTextureLoad = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
-                            "gEnhancements.Graphics.AsyncTextureLoad", 0) != 0;
+CPP_LATCH_NEW = """    mRgbDitherEnabled = Ship::Context::GetRawInstance()->GetConsoleVariables()->GetInteger(
+                            "gEnhancements.Graphics.DitherNoise", 0) != 0;
 
     // OVERLAY 0036: do the CI4/CI8 palette lookup in the FRAGMENT SHADER? Default no.
     // The shader path costs a dependent texture tap per filter tap - three under PM64's
@@ -380,11 +397,10 @@ void Interpreter::TextureCacheDeleteByPalette(const uint8_t* palAddr) {
     for (auto it = mTextureCache.map.begin(); it != mTextureCache.map.end();) {
 """
 
-CPP_KEY_OLD = """    key.mip_levels = mCurrentMipExtraLevels;
-    if (mImportIndexed) {
+CPP_KEY_OLD = """    if (mImportIndexed) {
+        // Index textures don't depend on palette contents: the palette lookup
 """
-CPP_KEY_NEW = """    key.mip_levels = mCurrentMipExtraLevels;
-    // OVERLAY 0036 REV 2: a CPU-decoded CI entry keys on the TLUT's CONTENTS.
+CPP_KEY_NEW = """    // OVERLAY 0036 REV 2: a CPU-decoded CI entry keys on the TLUT's CONTENTS.
     // The address form above is correct but far too fine: PM64's sprite shading
     // writes an identical two-tone palette into a different slot of a 512-entry
     // ring every frame, so address keying re-decoded and re-uploaded the same
@@ -392,8 +408,9 @@ CPP_KEY_NEW = """    key.mip_levels = mCurrentMipExtraLevels;
     // than adding to them - is what turns the ring into one entry;
     // palette_index goes too, since the hash already covers the exact bank it
     // selects. A 0 hash means the palette was not available, and the key stays
-    // exactly as it was.
-    if (fmt == G_IM_FMT_CI && !mImportIndexed && mPaletteKeyByContent) {
+    // exactly as it was. Rev 4: not when upstream keyed the tile on an HD
+    // palette variant (palette_variant != 0) - that key is upstream's own.
+    if (fmt == G_IM_FMT_CI && !mImportIndexed && mPaletteKeyByContent && key.palette_variant == 0) {
         const uint64_t pbPalHash = PbPaletteContentHash(siz, paletteIndex);
         if (pbPalHash != 0) {
             key.palette_addrs[0] = nullptr;
@@ -403,6 +420,7 @@ CPP_KEY_NEW = """    key.mip_levels = mCurrentMipExtraLevels;
         }
     }
     if (mImportIndexed) {
+        // Index textures don't depend on palette contents: the palette lookup
 """
 
 CPP_INSERT_OLD = """    it = mTextureCache.map.insert(std::make_pair(key, TextureCacheValue())).first;
